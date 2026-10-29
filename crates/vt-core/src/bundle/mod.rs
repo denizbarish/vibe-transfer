@@ -14,8 +14,7 @@
 //! - kind 4 End: blake3 of every inner stream byte before this frame.
 
 use std::fmt;
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::manifest::Manifest;
 use crate::secret_types::SecretItem;
@@ -111,33 +110,16 @@ pub(crate) fn identity(pass: &age::secrecy::SecretString) -> age::scrypt::Identi
     identity
 }
 
-/// Creates a new file readable only by the owner; fails if it exists.
-pub(crate) fn create_private_file(path: &Path) -> std::io::Result<File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)
-}
-
-/// Creates `path` and missing parents, each new one owner-only.
-pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(path)
-}
-
 /// Test support only: decrypts the inner stream of `path`, lets `edit` change
 /// it and re-encrypts it in place. Holds the whole bundle in memory.
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub fn tamper_inner_stream(
-    path: &Path,
+    path: &std::path::Path,
     pass: &age::secrecy::SecretString,
     edit: impl FnOnce(&mut Vec<u8>),
 ) -> anyhow::Result<()> {
+    use std::fs::File;
     use std::io::{BufReader, BufWriter, Read, Write};
 
     use anyhow::Context;

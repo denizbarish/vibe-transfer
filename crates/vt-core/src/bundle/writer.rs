@@ -36,7 +36,7 @@ pub struct BundleWriter {
 
 impl BundleWriter {
     pub fn create(path: &Path, pass: &SecretString) -> Result<Self> {
-        let file = super::create_private_file(path)
+        let file = crate::fsutil::create_private_file(path)
             .with_context(|| format!("paket oluşturulamadı: {}", path.display()))?;
         let stream = super::encryptor(pass)
             .wrap_output(BufWriter::new(file))

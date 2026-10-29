@@ -62,7 +62,7 @@ fn read_inner(path: &Path, pass: &SecretString, blobs: &Path) -> Result<ReadBund
     let stream = age::Decryptor::new_buffered(BufReader::new(file))
         .and_then(|d| d.decrypt(std::iter::once(&identity as &dyn age::Identity)))
         .map_err(map_age_error)?;
-    super::create_private_dir_all(blobs)
+    crate::fsutil::create_private_dir_all(blobs)
         .with_context(|| format!("hazırlık dizini oluşturulamadı: {}", blobs.display()))?;
 
     let mut st = State {
@@ -254,7 +254,7 @@ impl<R: Read> State<R> {
                 return Err(BundleError::corrupt(format!("{what}, öğe {index}")).into());
             }
             let path = self.blobs.join(index.to_string());
-            let file = super::create_private_file(&path)
+            let file = crate::fsutil::create_private_file(&path)
                 .with_context(|| format!("blob yazılamadı: {}", path.display()))?;
             self.open = Some(OpenBlob {
                 index,
