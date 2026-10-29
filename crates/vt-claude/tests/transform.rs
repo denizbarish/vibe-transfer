@@ -97,8 +97,9 @@ fn rewrite_json_paths_settings_hooks() {
         "note": "/Users/src2/x and prefix/Users/srcfoo",
         "n": 3
     });
-    let count = rewrite_json_paths(&mut v, SRC, DST, &BTreeMap::new());
-    assert_eq!(count, 2);
+    let out = rewrite_json_paths(&mut v, SRC, DST, &BTreeMap::new());
+    assert_eq!(out.count, 2);
+    assert!(out.conflicts.is_empty());
     assert_eq!(
         v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
         "bash /Users/dst/.claude/hooks/a.sh"
@@ -112,16 +113,17 @@ fn rewrite_json_paths_settings_hooks() {
 fn rewrite_json_paths_projects_keys_and_repo_paths() {
     let mut v = json!({
         "projects": {
-            "/Users/src/code/acme": { "lastSessionId": "s1", "x": "/Users/src/code/acme/a" },
+            "/Users/src/code/acme": { "lastSessionId": "s1", "x": "/Users/src/code/acme/a", "cmd": "run /Users/src/code/acme/a" },
             "/Users/src/code/acme/sub": {},
             "/Users/src/other": {},
             "/opt/elsewhere": {}
         },
-        "githubRepoPaths": { "acme/app": ["/Users/src/code/acme", "/opt/elsewhere"] },
+        "githubRepoPaths": { "acme/app": ["/Users/src/code/acme", "/opt/elsewhere", "/Users/src/code/acme"] },
         "mcpServers": { "m": { "command": "/Users/src/bin/m" } }
     });
     let pm = map(&[("/Users/src/code/acme", "/Users/dst/work/acme")]);
-    let count = rewrite_json_paths(&mut v, SRC, DST, &pm);
+    let out = rewrite_json_paths(&mut v, SRC, DST, &pm);
+    assert!(out.conflicts.is_empty());
 
     let keys: Vec<&str> = v["projects"]
         .as_object()
@@ -139,24 +141,96 @@ fn rewrite_json_paths_projects_keys_and_repo_paths() {
         ]
     );
     assert_eq!(v["projects"]["/Users/dst/work/acme"]["lastSessionId"], "s1");
-    // Values inside entries get the home rewrite only.
+    // A whole-path value goes through the project mapping; text with an
+    // embedded path gets the home rewrite only.
     assert_eq!(
         v["projects"]["/Users/dst/work/acme"]["x"],
-        "/Users/dst/code/acme/a"
+        "/Users/dst/work/acme/a"
+    );
+    assert_eq!(
+        v["projects"]["/Users/dst/work/acme"]["cmd"],
+        "run /Users/dst/code/acme/a"
     );
     assert_eq!(
         v["githubRepoPaths"]["acme/app"],
         json!(["/Users/dst/work/acme", "/opt/elsewhere"])
     );
     assert_eq!(v["mcpServers"]["m"]["command"], "/Users/dst/bin/m");
-    // 3 project keys + 1 value inside + 1 repo path + 1 mcp command.
-    assert_eq!(count, 6);
+    // 3 project keys + 2 values inside + 2 repo paths (one then deduplicated)
+    // + 1 mcp command.
+    assert_eq!(out.count, 8);
+}
+
+#[test]
+fn rewrite_json_paths_whole_path_values_use_project_map() {
+    // installed_plugins.json style.
+    let mut v = json!({
+        "plugins": { "p@m": [{
+            "installPath": "/Users/src/.claude/plugins/cache/p",
+            "projectPath": "/Users/src/code/acme/web",
+            "note": "/Users/src/code/acme cd /Users/src/code/acme"
+        }] }
+    });
+    let pm = map(&[("/Users/src/code/acme", "/Users/dst/work/acme")]);
+    let out = rewrite_json_paths(&mut v, SRC, DST, &pm);
+    let entry = &v["plugins"]["p@m"][0];
+    assert_eq!(entry["installPath"], "/Users/dst/.claude/plugins/cache/p");
+    assert_eq!(entry["projectPath"], "/Users/dst/work/acme/web");
+    assert_eq!(
+        entry["note"],
+        "/Users/dst/code/acme cd /Users/dst/code/acme"
+    );
+    assert_eq!(out.count, 3);
+}
+
+#[test]
+fn rewrite_json_paths_collapses_equal_nfc_nfd_project_keys() {
+    let nfc: String = "/Users/src/Kişisel".nfc().collect();
+    let nfd: String = "/Users/src/Kişisel".nfd().collect();
+    let mut v = json!({ "projects": {
+        nfc.clone(): { "hasTrustDialogAccepted": true },
+        nfd.clone(): { "hasTrustDialogAccepted": true }
+    } });
+    let pm = map(&[(&nfc, "/Users/dst/Kişisel")]);
+    let out = rewrite_json_paths(&mut v, SRC, DST, &pm);
+    assert!(out.conflicts.is_empty());
+    assert_eq!(
+        v["projects"],
+        json!({ "/Users/dst/Kişisel": { "hasTrustDialogAccepted": true } })
+    );
+    assert_eq!(out.count, 2);
+}
+
+#[test]
+fn rewrite_json_paths_reports_differing_colliding_project_keys() {
+    let nfc: String = "/Users/src/Kişisel".nfc().collect();
+    let nfd: String = "/Users/src/Kişisel".nfd().collect();
+    let mut v = json!({ "projects": {
+        nfc.clone(): { "lastSessionId": "a" },
+        nfd.clone(): { "lastSessionId": "b" }
+    } });
+    let pm = map(&[(&nfc, "/Users/dst/Kişisel")]);
+    let out = rewrite_json_paths(&mut v, SRC, DST, &pm);
+
+    // The first by old key is kept; no source-path key is left behind.
+    let (first, second) = if nfc < nfd { ("a", "b") } else { ("b", "a") };
+    assert_eq!(
+        v["projects"],
+        json!({ "/Users/dst/Kişisel": { "lastSessionId": first } })
+    );
+    assert_eq!(out.conflicts.len(), 1);
+    assert_eq!(out.conflicts[0].path, "projects./Users/dst/Kişisel");
+    assert_eq!(out.conflicts[0].source, json!({ "lastSessionId": second }));
+    assert_eq!(out.conflicts[0].target, json!({ "lastSessionId": first }));
 }
 
 #[test]
 fn rewrite_json_paths_root_home_is_noop() {
     let mut v = json!({ "a": "/Users/src/x" });
-    assert_eq!(rewrite_json_paths(&mut v, "/", DST, &BTreeMap::new()), 0);
+    assert_eq!(
+        rewrite_json_paths(&mut v, "/", DST, &BTreeMap::new()).count,
+        0
+    );
     assert_eq!(v["a"], "/Users/src/x");
 }
 
@@ -226,6 +300,27 @@ fn merge_claude_json_takes_oauth_account_when_asked() {
 }
 
 #[test]
+fn merge_claude_json_unmergeable_document_is_a_conflict() {
+    let source = json!({ "projects": { "/Users/dst/a": {} } });
+    let mut target = json!([1, 2]);
+    let conflicts = merge_claude_json(&mut target, &source, false);
+    assert_eq!(target, json!([1, 2]));
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, "");
+    assert_eq!(conflicts[0].source, source);
+    assert_eq!(conflicts[0].target, json!([1, 2]));
+
+    let mut target = json!({ "userID": "t" });
+    let conflicts = merge_claude_json(&mut target, &json!("broken"), false);
+    assert_eq!(target, json!({ "userID": "t" }));
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, "");
+
+    // A null source has nothing to merge.
+    assert!(merge_claude_json(&mut target, &Value::Null, false).is_empty());
+}
+
+#[test]
 fn merge_memory_md_dedup() {
     let target = "# Memory\n- [A](a.md): one\n\n- [B](b.md): two\n";
     let source = "# Memory\n- [A](a.md): one\n- [C](c.md): three\n\n\n\n- [D](d.md): four\n\n\n";
@@ -241,6 +336,11 @@ fn merge_memory_md_keeps_target_newline_convention() {
     assert_eq!(merge_memory_md("a\n", "a\n"), "a\n");
     assert_eq!(merge_memory_md("a\n", "\n\nb\n\n"), "a\nb\n");
     assert_eq!(merge_memory_md("", "x\ny\n"), "x\ny\n");
+    assert_eq!(
+        merge_memory_md("a\r\nb\r\n", "b\nc\n\nd\n"),
+        "a\r\nb\r\nc\r\n\r\nd\r\n"
+    );
+    assert_eq!(merge_memory_md("a\r\nb", "c\n"), "a\r\nb\r\nc");
 }
 
 #[test]

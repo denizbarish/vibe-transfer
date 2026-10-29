@@ -5,9 +5,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
 use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
+use vt_core::manifest::JsonConflict;
 use vt_core::pathcodec::claude_slug;
 use vt_core::pathmap::rewrite_home;
 
@@ -49,57 +50,59 @@ pub fn memory_slug_for(git_root: &Path) -> String {
     claude_slug(&git_root.to_string_lossy())
 }
 
+/// Result of `rewrite_json_paths`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RewriteOutcome {
+    /// Strings and keys that changed.
+    pub count: u32,
+    /// `projects` entries that landed on one target key with different
+    /// values; the first entry (by old key) was kept under that key.
+    pub conflicts: Vec<JsonConflict>,
+}
+
 /// Rewrites absolute paths in a JSON document (`~/.claude.json`, settings,
-/// plugin registries, project `.mcp.json`) and returns how many strings and
-/// keys changed.
+/// plugin registries, project `.mcp.json`).
 ///
-/// Every string value gets `rewrite_home`. Keys of the top-level `projects`
-/// object and the paths in top-level `githubRepoPaths` arrays are mapped
-/// through `project_map` first (exact path or a path below it); only paths
-/// without a project mapping fall back to `rewrite_home`. A `projects` key
-/// whose new name would collide with another entry keeps its old name.
+/// A string value that is one whole absolute path (see `is_whole_path`) is
+/// mapped through `project_map` first (exact path or a path below a
+/// project) and falls back to `rewrite_home`. A string with embedded paths,
+/// such as a hook command or a permission rule, gets `rewrite_home` only.
+/// Keys of the top-level `projects` object and the paths in top-level
+/// `githubRepoPaths` arrays are always treated as whole paths; those arrays
+/// are deduplicated afterwards, keeping the first occurrence.
+///
+/// When several `projects` keys land on one target key (e.g. NFC and NFD
+/// spellings of one folder), equal entries collapse into one; otherwise the
+/// first by old key is kept and every other one is returned as a conflict.
+/// No source-path key is left behind.
 pub fn rewrite_json_paths(
     v: &mut Value,
     src_home: &str,
     dst_home: &str,
     project_map: &BTreeMap<String, PathBuf>,
-) -> u32 {
-    let rewrite = |s: &str| rewrite_path(s, src_home, dst_home, project_map);
-    let Value::Object(top) = v else {
-        return rewrite_strings(v, src_home, dst_home);
+) -> RewriteOutcome {
+    let rw = Rewriter {
+        src_home,
+        dst_home,
+        project_map,
     };
-    let mut count = 0;
+    let mut out = RewriteOutcome::default();
+    let Value::Object(top) = v else {
+        out.count = rw.value(v);
+        return out;
+    };
     for (key, value) in top.iter_mut() {
         match (key.as_str(), value) {
-            ("projects", Value::Object(projects)) => {
-                count += rename_keys(projects, &rewrite);
-                for entry in projects.values_mut() {
-                    count += rewrite_strings(entry, src_home, dst_home);
-                }
-            }
+            ("projects", Value::Object(projects)) => rw.projects(projects, &mut out),
             ("githubRepoPaths", Value::Object(repos)) => {
                 for paths in repos.values_mut() {
-                    let Value::Array(paths) = paths else {
-                        count += rewrite_strings(paths, src_home, dst_home);
-                        continue;
-                    };
-                    for p in paths {
-                        match p {
-                            Value::String(s) => {
-                                if let Some(new) = rewrite(s) {
-                                    *s = new;
-                                    count += 1;
-                                }
-                            }
-                            other => count += rewrite_strings(other, src_home, dst_home),
-                        }
-                    }
+                    out.count += rw.repo_paths(paths);
                 }
             }
-            (_, value) => count += rewrite_strings(value, src_home, dst_home),
+            (_, value) => out.count += rw.value(value),
         }
     }
-    count
+    out
 }
 
 /// Rewrites the top-level `cwd` string of one jsonl line, leaving every
@@ -150,78 +153,109 @@ fn map_project_path(path: &str, mapping: &BTreeMap<String, PathBuf>) -> Option<S
     best.map(|(_, target)| target)
 }
 
-/// Project mapping first, then the home rewrite; `None` when unchanged.
-fn rewrite_path(
-    s: &str,
-    src_home: &str,
-    dst_home: &str,
-    project_map: &BTreeMap<String, PathBuf>,
-) -> Option<String> {
-    map_project_path(s, project_map)
-        .or_else(|| Some(rewrite_home(s, src_home, dst_home)))
-        .filter(|new| new != s)
+/// One rewrite run: source and target homes plus the project mapping.
+struct Rewriter<'a> {
+    src_home: &'a str,
+    dst_home: &'a str,
+    project_map: &'a BTreeMap<String, PathBuf>,
 }
 
-/// Applies `rewrite_home` to every string value (not keys) under `v`.
-fn rewrite_strings(v: &mut Value, src_home: &str, dst_home: &str) -> u32 {
-    match v {
-        Value::String(s) => {
-            let new = rewrite_home(s, src_home, dst_home);
-            if new == *s {
-                0
-            } else {
-                *s = new;
-                1
+impl Rewriter<'_> {
+    /// A whole path: project mapping first, then the home rewrite; `None`
+    /// when unchanged.
+    fn path(&self, s: &str) -> Option<String> {
+        map_project_path(s, self.project_map)
+            .or_else(|| Some(rewrite_home(s, self.src_home, self.dst_home)))
+            .filter(|new| new != s)
+    }
+
+    /// Any string value; `None` when unchanged.
+    fn string(&self, s: &str) -> Option<String> {
+        if is_whole_path(s) {
+            self.path(s)
+        } else {
+            Some(rewrite_home(s, self.src_home, self.dst_home)).filter(|new| new != s)
+        }
+    }
+
+    /// Rewrites every string value (not keys) under `v`.
+    fn value(&self, v: &mut Value) -> u32 {
+        match v {
+            Value::String(s) => match self.string(s) {
+                Some(new) => {
+                    *s = new;
+                    1
+                }
+                None => 0,
+            },
+            Value::Array(items) => items.iter_mut().map(|item| self.value(item)).sum(),
+            Value::Object(map) => map.values_mut().map(|item| self.value(item)).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Renames `projects` keys and rewrites their entries; entries that land
+    /// on one key collapse or become conflicts.
+    fn projects(&self, projects: &mut Map<String, Value>, out: &mut RewriteOutcome) {
+        // `Map` is sorted, so the first entry per target key is the one with
+        // the smallest old key.
+        for (old_key, mut entry) in std::mem::take(projects) {
+            out.count += self.value(&mut entry);
+            let new_key = match self.path(&old_key) {
+                Some(new_key) => {
+                    out.count += 1;
+                    new_key
+                }
+                None => old_key,
+            };
+            match projects.get(&new_key) {
+                None => {
+                    projects.insert(new_key, entry);
+                }
+                Some(kept) if *kept == entry => {}
+                Some(kept) => out.conflicts.push(JsonConflict {
+                    path: format!("projects.{new_key}"),
+                    source: entry,
+                    target: kept.clone(),
+                }),
             }
         }
-        Value::Array(items) => items
-            .iter_mut()
-            .map(|item| rewrite_strings(item, src_home, dst_home))
-            .sum(),
-        Value::Object(map) => map
-            .values_mut()
-            .map(|item| rewrite_strings(item, src_home, dst_home))
-            .sum(),
-        _ => 0,
+    }
+
+    /// Rewrites one `githubRepoPaths` value and drops duplicate paths.
+    fn repo_paths(&self, paths: &mut Value) -> u32 {
+        let Value::Array(items) = paths else {
+            return self.value(paths);
+        };
+        let mut count = 0;
+        let mut kept: Vec<Value> = Vec::with_capacity(items.len());
+        for mut item in std::mem::take(items) {
+            match &mut item {
+                Value::String(s) => {
+                    if let Some(new) = self.path(s) {
+                        *s = new;
+                        count += 1;
+                    }
+                }
+                other => count += self.value(other),
+            }
+            if !kept.contains(&item) {
+                kept.push(item);
+            }
+        }
+        *items = kept;
+        count
     }
 }
 
-/// Renames the keys of `map` with `rewrite`. Keys whose new name would be
-/// shared with another entry keep their old name, so no entry is lost.
-/// Returns how many keys were renamed.
-fn rename_keys(
-    map: &mut serde_json::Map<String, Value>,
-    rewrite: &dyn Fn(&str) -> Option<String>,
-) -> u32 {
-    let old: Vec<String> = map.keys().cloned().collect();
-    let mut new: Vec<String> = old
-        .iter()
-        .map(|k| rewrite(k).unwrap_or_else(|| k.clone()))
-        .collect();
-    // Revert colliding renames until every key is unique. Old keys are
-    // unique, so this ends.
-    loop {
-        let mut seen: HashMap<&str, usize> = HashMap::new();
-        for k in &new {
-            *seen.entry(k.as_str()).or_default() += 1;
-        }
-        let clashing: Vec<usize> = (0..new.len())
-            .filter(|&i| seen[new[i].as_str()] > 1 && new[i] != old[i])
-            .collect();
-        if clashing.is_empty() {
-            break;
-        }
-        for i in clashing {
-            new[i] = old[i].clone();
-        }
-    }
-    let mut renamed = 0;
-    let entries = std::mem::take(map);
-    for ((_, value), (old_key, new_key)) in entries.into_iter().zip(old.iter().zip(new)) {
-        if new_key != *old_key {
-            renamed += 1;
-        }
-        map.insert(new_key, value);
-    }
-    renamed
+/// Whether `s` is one whole absolute path rather than text with paths in
+/// it: it starts with `/`, has no control characters, and no other path
+/// starts inside it (a `/` right after a space, quote, `=` or `(`).
+fn is_whole_path(s: &str) -> bool {
+    s.starts_with('/')
+        && !s.chars().any(char::is_control)
+        && !s
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[1] == b'/' && matches!(w[0], b' ' | b'"' | b'\'' | b'=' | b'('))
 }

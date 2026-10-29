@@ -15,8 +15,8 @@ pub use inventory::{Inventory, classify};
 pub use merge::{merge_claude_json, merge_memory_md};
 pub use projects::project_inner_files;
 pub use transform::{
-    CLAUDE_REWRITE_JSONL_CWD, memory_slug_for, rewrite_json_paths, rewrite_jsonl_cwd,
-    target_slug_dir,
+    CLAUDE_REWRITE_JSONL_CWD, RewriteOutcome, memory_slug_for, rewrite_json_paths,
+    rewrite_jsonl_cwd, target_slug_dir,
 };
 
 /// Claude Code adapter bound to one (possibly synthetic) environment.

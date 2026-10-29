@@ -21,19 +21,28 @@ const OAUTH_ACCOUNT_KEY: &str = "oauthAccount";
 /// `githubRepoPaths` arrays are united: target order first, then source
 /// paths the target lacks. `oauthAccount` replaces the target value,
 /// because the login token moves with it.
+///
+/// A null source has nothing to merge. Any other non-object source, or a
+/// non-null non-object target, cannot be merged at all and comes back as a
+/// single conflict with path `""` (the whole document), target unchanged.
 pub fn merge_claude_json(
     target: &mut Value,
     source: &Value,
     take_oauth_account: bool,
 ) -> Vec<JsonConflict> {
     let mut conflicts = Vec::new();
-    let Value::Object(src) = source else {
+    if source.is_null() {
         return conflicts;
-    };
-    if target.is_null() {
+    }
+    if target.is_null() && source.is_object() {
         *target = Value::Object(Map::new());
     }
-    let Value::Object(dst) = target else {
+    let (Value::Object(dst), Value::Object(src)) = (&mut *target, source) else {
+        conflicts.push(JsonConflict {
+            path: String::new(),
+            source: source.clone(),
+            target: target.clone(),
+        });
         return conflicts;
     };
 
@@ -113,7 +122,8 @@ fn union_arrays(target: &Value, source: &Value) -> Option<Value> {
 ///
 /// Blank source lines survive only between two added lines, collapsed to
 /// one. The result ends with a newline when the target does (or, for an
-/// empty target, when the source does).
+/// empty target, when the source does). A CRLF target gets CRLF line ends
+/// on the added lines too.
 pub fn merge_memory_md(target: &str, source: &str) -> String {
     let existing: HashSet<&str> = target.lines().collect();
     let mut added: Vec<&str> = Vec::new();
@@ -141,13 +151,18 @@ pub fn merge_memory_md(target: &str, source: &str) -> String {
     } else {
         target.ends_with('\n')
     };
+    let eol = if target.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut out = target.to_owned();
     if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+        out.push_str(eol);
     }
-    out.push_str(&added.join("\n"));
+    out.push_str(&added.join(eol));
     if trailing_newline {
-        out.push('\n');
+        out.push_str(eol);
     }
     out
 }
