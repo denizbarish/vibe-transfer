@@ -143,6 +143,11 @@ fn classify_table() {
         ("jobs/state.json", Some((Never, Cache))),
         ("ide/123.lock", Some((Never, Cache))),
         ("tasks/s1/.lock", Some((Never, Cache))),
+        ("history.lock", Some((Never, Cache))),
+        // Lock files in user data are user content.
+        ("skills/x/bun.lock", Some((Transfer, Settings))),
+        ("projects/-a/memory/notes.lock", Some((Transfer, Memory))),
+        ("plugins/data/demo/yarn.lock", Some((Transfer, Settings))),
         ("shell-snapshots/snapshot-zsh-1.sh", Some((Never, Cache))),
         ("session-env/s1", Some((Never, Cache))),
         ("telemetry/1p_failed_events.json", Some((Never, Cache))),
@@ -398,4 +403,123 @@ fn read_claude_json_stable_parses_and_reports_bad_json() {
     fs::write(&bad, r#"{"projects":"#).unwrap();
     assert!(read_claude_json_stable(&bad).is_err());
     assert!(read_claude_json_stable(&tmp.path().join("missing.json")).is_err());
+}
+
+/// Rewrites `~/.claude.json` through `f`.
+fn edit_claude_json(env: &VtEnv, f: impl FnOnce(&mut serde_json::Value)) {
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&env.claude_json).unwrap()).unwrap();
+    f(&mut json);
+    fs::write(&env.claude_json, json.to_string()).unwrap();
+}
+
+#[test]
+fn corrupt_claude_json_does_not_abort_inventory() {
+    let (_tmp, env) = setup();
+    fs::write(&env.claude_json, "{\"projects\":").unwrap();
+    let adapter = ClaudeAdapter { env: env.clone() };
+
+    let inv = adapter.inventory(&selection(DEFAULT)).unwrap();
+    let reason = skip_reason(&inv, "claude_json").expect("claude_json reported");
+    assert!(reason.starts_with("okunamadı"), "{reason}");
+    assert!(
+        inv.entries
+            .iter()
+            .all(|(e, _)| e.root != RootKind::ClaudeJson)
+    );
+    // Projects still come from the session cwd fields.
+    let ids: Vec<&str> = inv.projects.iter().map(|p| p.id.0.as_str()).collect();
+    assert!(ids.contains(&"github.com/acme/app"), "{ids:?}");
+    assert!(ids.contains(&"path:/Users/src/plain"), "{ids:?}");
+    assert!(rels(&inv, &RootKind::ClaudeDir).contains(&"CLAUDE.md".to_owned()));
+    assert_eq!(adapter.project_refs().unwrap().len(), 2);
+}
+
+#[test]
+fn non_utf8_name_does_not_lose_other_entries() {
+    use std::os::unix::ffi::OsStrExt;
+    let (_tmp, env) = setup();
+    let bad = env
+        .claude_dir
+        .join("projects")
+        .join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
+    if let Err(e) = fs::create_dir(&bad) {
+        // APFS refuses non-UTF-8 names (EILSEQ); Linux file systems allow them.
+        eprintln!("non-UTF-8 names unsupported here ({e}); test skipped");
+        return;
+    }
+    fs::write(bad.join("s.jsonl"), "{}\n").unwrap();
+    let adapter = ClaudeAdapter { env };
+
+    let inv = adapter.inventory(&selection(DEFAULT)).unwrap();
+    let claude = rels(&inv, &RootKind::ClaudeDir);
+    assert!(claude.contains(&"projects/-Users-src-app/s-app.jsonl".to_owned()));
+    assert!(claude.contains(&"CLAUDE.md".to_owned()));
+    let reason = skip_reason(&inv, "projects/bad-\u{FFFD}-name").expect("bad name reported");
+    assert!(reason.contains("UTF-8"), "{reason}");
+}
+
+#[test]
+fn home_as_project_does_not_duplicate_or_walk() {
+    let (_tmp, env) = setup();
+    let home = env.home.clone();
+    fs::write(home.join("CLAUDE.md"), "# Home\n").unwrap();
+    fs::write(home.join(".mcp.json"), "{}\n").unwrap();
+    fs::create_dir_all(home.join("Library/notes")).unwrap();
+    fs::write(home.join("Library/notes/CLAUDE.md"), "# Lib\n").unwrap();
+    fs::create_dir_all(home.join("code/notes")).unwrap();
+    fs::write(home.join("code/notes/CLAUDE.md"), "# Notes\n").unwrap();
+    edit_claude_json(&env, |json| {
+        let projects = json["projects"].as_object_mut().unwrap();
+        projects.insert(home.to_str().unwrap().into(), serde_json::json!({}));
+        projects.insert(
+            home.join("code").to_str().unwrap().into(),
+            serde_json::json!({}),
+        );
+    });
+    let adapter = ClaudeAdapter { env: env.clone() };
+    let inv = adapter.inventory(&selection(DEFAULT)).unwrap();
+
+    let home_root = RootKind::Project(ProjectId(format!("path:{}", home.display())));
+    let home_files = rels(&inv, &home_root);
+    assert_eq!(
+        home_files,
+        vec![".mcp.json", "CLAUDE.md"],
+        "home: {home_files:?}"
+    );
+
+    // A parent project skips nested project roots but keeps its own files.
+    let code_root = RootKind::Project(ProjectId(format!("path:{}", home.join("code").display())));
+    let code_files = rels(&inv, &code_root);
+    assert_eq!(
+        code_files,
+        vec!["notes", "notes/CLAUDE.md"],
+        "code: {code_files:?}"
+    );
+
+    // The app project still has its own files, once.
+    let app = RootKind::Project(ProjectId("github.com/acme/app".into()));
+    assert!(rels(&inv, &app).contains(&"CLAUDE.md".to_owned()));
+}
+
+#[test]
+fn container_category_is_fixed_precedence() {
+    let (_tmp, env) = setup();
+    let mut all = DEFAULT.to_vec();
+    all.push(Category::Cache);
+    let inv = ClaudeAdapter { env }.inventory(&selection(&all)).unwrap();
+    let category = |rel: &str| {
+        inv.entries
+            .iter()
+            .find(|(e, _)| e.root == RootKind::ClaudeDir && e.rel == rel)
+            .map(|(e, _)| e.category)
+    };
+    // `projects` holds Sessions and Memory: Sessions wins (Category order).
+    assert_eq!(category("projects"), Some(Category::Sessions));
+    assert_eq!(
+        category("projects/-Users-src-app"),
+        Some(Category::Sessions)
+    );
+    // `plugins` holds Settings and Cache: Settings wins.
+    assert_eq!(category("plugins"), Some(Category::Settings));
 }

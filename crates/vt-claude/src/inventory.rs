@@ -6,11 +6,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use vt_core::VtEnv;
 use vt_core::manifest::{Category, Class, Entry, EntryKind, ProjectRef, RootKind, Selection, Tool};
-use vt_core::scan::{RawEntry, scan_tree};
+use vt_core::scan::{NON_UTF8_NAME, NON_UTF8_TARGET, RawEntry, scan_tree, stat_entry};
 
 use crate::ClaudeAdapter;
-use crate::projects::{UNREADABLE, scan_project, unreadable_dir};
+use crate::projects::{ProjectScanOptions, UNREADABLE, scan_project, unreadable_dir};
 
 const UNSELECTED: &str = "kullanıcı seçimiyle atlandı";
 const NEVER: &str = "asla taşınmaz: makineye özgü";
@@ -93,7 +94,7 @@ fn rule(rel: &str) -> Rule {
     if first == ".credentials.json" {
         return item(Never, Secrets);
     }
-    if is_never(first, second, parts[parts.len() - 1]) {
+    if is_never(&parts) {
         return item(Never, Cache);
     }
     match first {
@@ -127,9 +128,14 @@ fn rule(rel: &str) -> Rule {
     }
 }
 
-/// Machine-specific paths that are never transferred.
-fn is_never(first: &str, second: Option<&str>, name: &str) -> bool {
-    name.ends_with(".lock")
+/// Machine-specific paths that are never transferred. Lock files count only
+/// where Claude itself writes them (top level, `tasks/<id>/.lock`, `ide/`);
+/// a lock file in user data such as `skills/x/bun.lock` is user content.
+fn is_never(parts: &[&str]) -> bool {
+    let first = parts[0];
+    let second = parts.get(1).copied();
+    (parts.len() == 1 && first.ends_with(".lock"))
+        || matches!(parts, ["tasks", _, ".lock"])
         || first.starts_with("daemon")
         || first.starts_with(".claude.json.tmp.")
         || first == ".claude.json.backup"
@@ -230,7 +236,8 @@ impl ClaudeAdapter {
             });
         }
 
-        c.add_claude_json(&env.claude_json);
+        let projects = self.collect_projects()?;
+        c.add_claude_json(&env.claude_json, projects.claude_json_error.as_deref());
 
         if fs::symlink_metadata(env.agents_dir.join("skills")).is_ok() {
             let settings = item(Class::Transfer, Category::Settings);
@@ -243,11 +250,16 @@ impl ClaudeAdapter {
             });
         }
 
-        let projects = self.collect_projects()?;
         c.skipped.extend(projects.skipped);
         c.notes.extend(projects.notes);
         for project in &projects.refs {
-            c.add_project(project, &env.claude_dir);
+            let others: Vec<&Path> = projects
+                .refs
+                .iter()
+                .filter(|p| p.old_path != project.old_path)
+                .map(|p| Path::new(&p.old_path))
+                .collect();
+            c.add_project(project, env, &others);
         }
 
         let mut entries = c.entries;
@@ -318,7 +330,7 @@ impl Collector<'_> {
             self.skip(root, &rel, reason);
         }
         for special in scan.skipped {
-            self.skip(root, &special.rel, format!("{SPECIAL}: {}", special.reason));
+            self.skip(root, &special.rel, scan_skip_reason(&special.reason));
         }
 
         let mut included = Vec::new();
@@ -358,7 +370,11 @@ impl Collector<'_> {
         for (raw, category) in &included {
             let mut rel = raw.rel.as_str();
             while let Some((parent, _)) = rel.rsplit_once('/') {
-                ancestors.entry(parent.to_owned()).or_insert(*category);
+                // Fixed precedence (Category order) keeps this order-independent.
+                ancestors
+                    .entry(parent.to_owned())
+                    .and_modify(|c| *c = (*c).min(*category))
+                    .or_insert(*category);
                 rel = parent;
             }
         }
@@ -393,7 +409,8 @@ impl Collector<'_> {
     }
 
     /// `~/.claude.json` as a single-file root with an empty `rel`.
-    fn add_claude_json(&mut self, path: &Path) {
+    /// `read_error` is set when it could not be read or parsed.
+    fn add_claude_json(&mut self, path: &Path, read_error: Option<&str>) {
         let root = RootKind::ClaudeJson;
         if fs::symlink_metadata(path).is_err() {
             return;
@@ -402,31 +419,27 @@ impl Collector<'_> {
             self.skip(&root, "", UNSELECTED);
             return;
         }
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-        else {
-            self.skip(&root, "", format!("{UNREADABLE}: geçersiz yol"));
+        if let Some(err) = read_error {
+            self.skip(&root, "", format!("{UNREADABLE}: {err}"));
             return;
-        };
-        let found = scan_tree(parent, &|rel| rel != name)
-            .map(|scan| scan.entries.into_iter().find(|e| e.rel == name));
-        match found {
-            Ok(Some(mut raw)) => {
-                raw.rel = String::new();
-                self.finish(
-                    &root,
-                    path,
-                    vec![(raw, Category::Settings)],
-                    Vec::new(),
-                    true,
-                );
-            }
-            Ok(None) => self.skip(&root, "", format!("{SPECIAL}: other")),
+        }
+        match stat_entry(path, String::new()) {
+            Ok(Ok(raw)) => self.finish(
+                &root,
+                path,
+                vec![(raw, Category::Settings)],
+                Vec::new(),
+                true,
+            ),
+            Ok(Err(special)) => self.skip(&root, "", scan_skip_reason(&special.reason)),
             Err(e) => self.skip(&root, "", format!("{UNREADABLE}: {e:#}")),
         }
     }
 
     /// Claude files inside one project, when it exists on this machine.
-    fn add_project(&mut self, project: &ProjectRef, claude_dir: &Path) {
+    /// `others` are the other project roots; they are never walked into.
+    fn add_project(&mut self, project: &ProjectRef, env: &VtEnv, others: &[&Path]) {
+        let claude_dir = env.claude_dir.as_path();
         let root_kind = RootKind::Project(project.id.clone());
         if !selected(self.sel, Category::ProjectFiles) {
             self.skip(&root_kind, "", UNSELECTED);
@@ -441,8 +454,14 @@ impl Collector<'_> {
             self.skip(&root_kind, "", INSIDE_CLAUDE_DIR);
             return;
         }
-        let skip_dot_claude = same_path(&root.join(".claude"), claude_dir);
-        let (scan, unreadable) = match scan_project(root, skip_dot_claude) {
+        let opts = ProjectScanOptions {
+            skip_dot_claude: same_path(&root.join(".claude"), claude_dir),
+            // The home dir (or a parent of it) is never walked for nested
+            // CLAUDE.md files: it holds other projects and protected folders.
+            nested: !env.home.starts_with(root),
+            excluded: others,
+        };
+        let (scan, unreadable) = match scan_project(root, &opts) {
             Ok(found) => found,
             Err(e) => {
                 self.skip(&root_kind, "", format!("{UNREADABLE}: {e:#}"));
@@ -453,11 +472,7 @@ impl Collector<'_> {
             self.skip(&root_kind, &rel, reason);
         }
         for special in scan.skipped {
-            self.skip(
-                &root_kind,
-                &special.rel,
-                format!("{SPECIAL}: {}", special.reason),
-            );
+            self.skip(&root_kind, &special.rel, scan_skip_reason(&special.reason));
         }
         let (containers, included): (Vec<_>, Vec<_>) = scan.entries.into_iter().partition(|e| {
             e.kind == EntryKind::Dir && e.rel != ".claude" && !e.rel.starts_with(".claude/")
@@ -468,6 +483,15 @@ impl Collector<'_> {
             .collect();
         // Search-only directories without a CLAUDE.md are not Claude data.
         self.finish(&root_kind, root, included, containers, false);
+    }
+}
+
+/// Report text for a `SkippedEntry` reason from `scan_tree`.
+fn scan_skip_reason(reason: &str) -> String {
+    match reason {
+        NON_UTF8_NAME => "UTF-8 olmayan dosya adı, aktarılamaz".into(),
+        NON_UTF8_TARGET => "UTF-8 olmayan symlink hedefi, aktarılamaz".into(),
+        other => format!("{SPECIAL}: {other}"),
     }
 }
 

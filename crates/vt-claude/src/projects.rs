@@ -31,6 +31,8 @@ pub(crate) struct ProjectScan {
     pub refs: Vec<ProjectRef>,
     pub skipped: Vec<(String, String)>,
     pub notes: Vec<(String, String)>,
+    /// Why `~/.claude.json` could not be used, if it exists but did not parse.
+    pub claude_json_error: Option<String>,
 }
 
 impl ClaudeAdapter {
@@ -40,7 +42,8 @@ impl ClaudeAdapter {
     /// 50 lines of each file), `~/.claude.json` `projects` keys and
     /// `githubRepoPaths`. Each path is folded into the nearest enclosing git
     /// root; the id is the normalized `origin` remote, else the
-    /// `githubRepoPaths` repo, else `path:<root>`.
+    /// `githubRepoPaths` repo, else `path:<root>`. A `~/.claude.json` that
+    /// cannot be read is left out here; `inventory` reports it.
     pub fn project_refs(&self) -> Result<Vec<ProjectRef>> {
         Ok(self.collect_projects()?.refs)
     }
@@ -51,8 +54,15 @@ impl ClaudeAdapter {
         for cwd in session_cwds(&self.env.claude_dir, &mut notes) {
             candidates.add(cwd, None);
         }
-        if fs::symlink_metadata(&self.env.claude_json).is_ok() {
-            let json = read_claude_json_stable(&self.env.claude_json)?;
+        let mut claude_json_error = None;
+        let json = if fs::symlink_metadata(&self.env.claude_json).is_ok() {
+            read_claude_json_stable(&self.env.claude_json)
+                .map_err(|e| claude_json_error = Some(format!("{e:#}")))
+                .ok()
+        } else {
+            None
+        };
+        if let Some(json) = json {
             if let Some(projects) = json.get("projects").and_then(Value::as_object) {
                 for path in projects.keys() {
                     candidates.add(path.clone(), None);
@@ -112,6 +122,7 @@ impl ClaudeAdapter {
             refs,
             skipped,
             notes,
+            claude_json_error,
         })
     }
 }
@@ -248,7 +259,12 @@ fn sorted_dir(dir: &Path) -> Vec<PathBuf> {
 /// `.codex/`) are not Claude's. An unreadable project gives an empty list;
 /// the inventory reports such errors instead.
 pub fn project_inner_files(project_root: &Path) -> Vec<String> {
-    match scan_project(project_root, false) {
+    let opts = ProjectScanOptions {
+        skip_dot_claude: false,
+        nested: true,
+        excluded: &[],
+    };
+    match scan_project(project_root, &opts) {
         Ok((scan, _)) => scan
             .entries
             .into_iter()
@@ -259,21 +275,34 @@ pub fn project_inner_files(project_root: &Path) -> Vec<String> {
     }
 }
 
+/// How [`scan_project`] walks one project.
+pub(crate) struct ProjectScanOptions<'a> {
+    /// Leave out `.claude/`: the home directory as a project, whose
+    /// `.claude/` is the Claude dir itself (already its own root).
+    pub skip_dot_claude: bool,
+    /// Search subdirectories for nested `CLAUDE.md` files.
+    pub nested: bool,
+    /// Other project roots; never walked into.
+    pub excluded: &'a [&'a Path],
+}
+
 /// Scans the Claude files of a project. Directories walked only to find
 /// nested `CLAUDE.md` files are part of the result; callers keep those that
-/// lead to an included file. `skip_dot_claude` leaves out `.claude/` (the
-/// home directory as a project, whose `.claude/` is the Claude dir itself).
-/// The second value lists unreadable directories under `.claude/`.
+/// lead to an included file. The second value lists unreadable directories
+/// under `.claude/`.
 pub(crate) fn scan_project(
     root: &Path,
-    skip_dot_claude: bool,
+    opts: &ProjectScanOptions,
 ) -> Result<(ScanResult, Vec<(String, String)>)> {
     let unreadable = RefCell::new(Vec::new());
     let exclude = |rel: &str| {
         let parts: Vec<&str> = rel.split('/').collect();
         let path = root.join(rel);
+        if opts.excluded.contains(&path.as_path()) {
+            return true;
+        }
         if parts[0] == ".claude" {
-            if skip_dot_claude || parts.get(1) == Some(&"worktrees") {
+            if opts.skip_dot_claude || parts.get(1) == Some(&"worktrees") {
                 return true;
             }
             if let Some(err) = unreadable_dir(&path) {
@@ -290,7 +319,8 @@ pub(crate) fn scan_project(
         let name = parts[parts.len() - 1];
         if md.is_dir() {
             // Search locations only: an unreadable one is not reported.
-            return parts.len() > NESTED_CLAUDE_MD_DEPTH
+            return !opts.nested
+                || parts.len() > NESTED_CLAUDE_MD_DEPTH
                 || PRUNED_DIRS.contains(&name)
                 || fs::read_dir(&path).is_err();
         }

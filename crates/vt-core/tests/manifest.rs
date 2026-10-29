@@ -112,6 +112,46 @@ fn scan_reports_special_files_as_skipped() {
     );
 }
 
+/// Creates a dir named by non-UTF-8 bytes; `None` where the file system
+/// refuses such names (APFS returns EILSEQ).
+#[cfg(unix)]
+pub fn make_non_utf8_dir(parent: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = parent.join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
+    match fs::create_dir(&path) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!("non-UTF-8 names unsupported here ({e}); test skipped");
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_skips_non_utf8_name_and_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join("sub/a.txt"), b"a").unwrap();
+    fs::write(root.join("z.txt"), b"z").unwrap();
+    let Some(bad) = make_non_utf8_dir(root) else {
+        return;
+    };
+    fs::write(bad.join("inner.txt"), b"x").unwrap();
+
+    let scan = scan_tree(root, &|_: &str| false).unwrap();
+    let rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+    assert_eq!(rels, vec!["sub", "sub/a.txt", "z.txt"]);
+    assert_eq!(
+        scan.skipped,
+        vec![SkippedEntry {
+            rel: "bad-\u{FFFD}-name".into(),
+            reason: vt_core::scan::NON_UTF8_NAME.into()
+        }]
+    );
+}
+
 fn entry(index: u32, root: RootKind, rel: &str, hash: [u8; 32]) -> Entry {
     Entry {
         index,
