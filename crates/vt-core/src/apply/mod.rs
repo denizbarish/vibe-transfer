@@ -8,7 +8,7 @@ mod conflict;
 mod fsops;
 mod journal;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
@@ -23,7 +23,7 @@ use crate::fsutil::{create_private_dir_all, create_private_file};
 use crate::manifest::EntryKind;
 use crate::scan::hash_file;
 use fsops::{
-    file_time, lstat, make_symlink, mode_of, move_path, set_mode, sync_parent, tmp_beside,
+    file_time, identity, lstat, make_symlink, mode_of, move_path, set_mode, sync_parent, tmp_beside,
 };
 use journal::{Journal, Op, Placed, hex};
 
@@ -93,15 +93,15 @@ pub fn apply(
     resolver: &mut dyn ConflictResolver,
 ) -> Result<ApplyReport> {
     validate_session(&plan.session_id)?;
+    create_private_dir_all(vt_home)
+        .with_context(|| format!("oluşturulamadı: {}", vt_home.display()))?;
     validate_plan(plan, vt_home)?;
     let journal = Journal::create(vt_home, &plan.session_id)?;
-    let mut run = Run {
+    let mut run = Run::new(
         journal,
-        backups: backup_root(vt_home, &plan.session_id),
-        host: &plan.source_host,
-        report: ApplyReport::default(),
-        new_dirs: Vec::new(),
-    };
+        backup_root(vt_home, &plan.session_id),
+        &plan.source_host,
+    );
     match run.execute(plan, resolver) {
         Ok(()) => Ok(run.report),
         Err(e) => {
@@ -142,9 +142,42 @@ struct Run<'a> {
     report: ApplyReport,
     /// Directories created from `Dir` placements and their mtime.
     new_dirs: Vec<(PathBuf, i64)>,
+    /// (dev, ino) of every symlink this session placed. No write may go
+    /// through one of them, however the path spells it (case folding,
+    /// Unicode normalization).
+    placed_links: HashSet<(u64, u64)>,
 }
 
-impl Run<'_> {
+impl<'a> Run<'a> {
+    fn new(journal: Journal, backups: PathBuf, host: &'a str) -> Self {
+        Self {
+            journal,
+            backups,
+            host,
+            report: ApplyReport::default(),
+            new_dirs: Vec::new(),
+            placed_links: HashSet::new(),
+        }
+    }
+
+    /// Fails if an existing ancestor of `path` (not followed) is a symlink
+    /// this session placed.
+    fn guard(&self, path: &Path) -> Result<()> {
+        if self.placed_links.is_empty() {
+            return Ok(());
+        }
+        for a in path.ancestors().skip(1) {
+            let Some(md) = lstat(a)? else { continue };
+            if identity(&md).is_some_and(|id| self.placed_links.contains(&id)) {
+                bail!(
+                    "hedef yolu bu oturumun yerleştirdiği symlink üzerinden geçiyor: {} ({})",
+                    path.display(),
+                    a.display()
+                );
+            }
+        }
+        Ok(())
+    }
     fn execute(&mut self, plan: &ApplyPlan, resolver: &mut dyn ConflictResolver) -> Result<()> {
         for scope in &plan.replace_scopes {
             self.clear_scope(scope)?;
@@ -195,6 +228,7 @@ impl Run<'_> {
     }
 
     fn place(&mut self, p: &Placement, resolver: &mut dyn ConflictResolver) -> Result<()> {
+        self.guard(&p.dest)?;
         if p.kind == EntryKind::Dir {
             return self.place_dir(p);
         }
@@ -208,23 +242,31 @@ impl Run<'_> {
                     return Ok(());
                 }
                 let res = resolver.file(&p.dest);
+                let outcome = match res {
+                    Resolution::KeepTarget => None,
+                    Resolution::KeepBoth => match self.free_keep_both_name(p)? {
+                        Some(t) => {
+                            self.report.kept_both.push(t.clone());
+                            Some((t, None))
+                        }
+                        // An earlier KeepBoth copy already holds this
+                        // content: nothing is written, nothing to report.
+                        None => {
+                            self.report.skipped_identical += 1;
+                            return Ok(());
+                        }
+                    },
+                    Resolution::KeepSource => {
+                        let b = self.backup(&p.dest)?;
+                        Some((p.dest.clone(), Some(b)))
+                    }
+                };
                 self.report
                     .conflicts
                     .push(format!("{}: {}", p.dest.display(), describe(res)));
-                match res {
-                    Resolution::KeepTarget => return Ok(()),
-                    Resolution::KeepBoth => {
-                        let Some(t) = self.free_keep_both_name(p)? else {
-                            self.report.skipped_identical += 1;
-                            return Ok(());
-                        };
-                        self.report.kept_both.push(t.clone());
-                        (t, None)
-                    }
-                    Resolution::KeepSource => {
-                        let b = self.backup(&p.dest)?;
-                        (p.dest.clone(), Some(b))
-                    }
+                match outcome {
+                    Some(o) => o,
+                    None => return Ok(()),
                 }
             }
         };
@@ -274,6 +316,7 @@ impl Run<'_> {
     /// Copies the blob next to `target`, sets mode and mtime, verifies the
     /// hash and renames it into place.
     fn write_file(&mut self, p: &Placement, target: &Path, backup: Option<PathBuf>) -> Result<()> {
+        self.guard(target)?;
         let hash = match p.expected_hash {
             Some(h) => h,
             None => hash_file(&p.blob)?,
@@ -316,6 +359,7 @@ impl Run<'_> {
         target: &Path,
         backup: Option<PathBuf>,
     ) -> Result<()> {
+        self.guard(target)?;
         let tmp = tmp_beside(target);
         self.journal.append(&Op::Place {
             dest: target.to_path_buf(),
@@ -330,6 +374,12 @@ impl Run<'_> {
             let t = file_time(p.mtime_ns);
             filetime::set_symlink_file_times(&tmp, t, t)
                 .with_context(|| format!("zaman ayarlanamadı: {}", tmp.display()))?;
+            // Recorded before the rename: the inode stays the same.
+            let md = fs::symlink_metadata(&tmp)
+                .with_context(|| format!("okunamadı: {}", tmp.display()))?;
+            if let Some(id) = identity(&md) {
+                self.placed_links.insert(id);
+            }
             fs::rename(&tmp, target).context("yerine taşınamadı")
         })();
         if result.is_err() {
@@ -343,6 +393,7 @@ impl Run<'_> {
     /// Replaces `dest` with pretty JSON plus a newline, keeping the mode of
     /// a replaced regular file (0600 otherwise).
     fn write_json(&mut self, dest: &Path, value: &Value) -> Result<()> {
+        self.guard(dest)?;
         let mut bytes = serde_json::to_vec_pretty(value).context("JSON yazılamadı")?;
         bytes.push(b'\n');
         let mut mode = 0o600;
@@ -393,6 +444,7 @@ impl Run<'_> {
 
     /// Moves the object at `dest` (not following symlinks) to the backup.
     fn backup(&mut self, dest: &Path) -> Result<PathBuf> {
+        self.guard(dest)?;
         let to = unique_path(&mirror_path(&self.backups.join("abs"), dest))?;
         let parent = to.parent().expect("mirror path has a parent");
         create_private_dir_all(parent)
@@ -425,6 +477,7 @@ impl Run<'_> {
     /// there meanwhile. That `mkdir` line is then marked undone at once, so
     /// rollback never removes a directory this session did not create.
     fn mkdir(&mut self, dir: &Path) -> Result<bool> {
+        self.guard(dir)?;
         let seq = self.journal.append(&Op::Mkdir {
             dest: dir.to_path_buf(),
         })?;
@@ -560,7 +613,7 @@ fn validate_plan(plan: &ApplyPlan, vt_home: &Path) -> Result<()> {
         .filter(|p| matches!(p.kind, EntryKind::Symlink { .. }))
         .map(|p| p.dest.as_path())
         .collect();
-    let home = resolve(vt_home);
+    let home = HomeIds::of(vt_home)?;
     let dests = plan
         .placements
         .iter()
@@ -574,6 +627,7 @@ fn validate_plan(plan: &ApplyPlan, vt_home: &Path) -> Result<()> {
         if !clean {
             bail!("geçersiz hedef yolu: {}", d.display());
         }
+        // Spelling-based; `Run::guard` catches other spellings at runtime.
         if let Some(link) = d.ancestors().skip(1).find(|a| links.contains(a)) {
             bail!(
                 "hedef, aynı planın yerleştirdiği symlink altında: {} ({})",
@@ -581,33 +635,53 @@ fn validate_plan(plan: &ApplyPlan, vt_home: &Path) -> Result<()> {
                 link.display()
             );
         }
-        // The dest itself is never followed, only its ancestors.
-        let rd = match (d.parent(), d.file_name()) {
-            (Some(parent), Some(name)) => resolve(parent).join(name),
-            _ => d.clone(),
-        };
-        let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-        if overlaps(d, vt_home) || overlaps(&rd, &home) {
+        let lexical = d.starts_with(vt_home) || vt_home.starts_with(d);
+        if lexical || home.overlaps(d)? {
             bail!("hedef vibe-transfer dizini ile çakışıyor: {}", d.display());
         }
     }
     Ok(())
 }
 
-/// `path` with its deepest existing ancestor canonicalized (symlinks and
-/// `/var` style aliases resolved), the missing rest appended as is.
-fn resolve(path: &Path) -> PathBuf {
-    for base in path.ancestors() {
-        if let Ok(real) = base.canonicalize() {
-            let rest = path.strip_prefix(base).unwrap_or(Path::new(""));
-            return if rest.as_os_str().is_empty() {
-                real
-            } else {
-                real.join(rest)
-            };
-        }
+/// Identities of the (existing) `vt_home` and its ancestors, so overlap is
+/// found whatever the spelling: case variants, Unicode normalization,
+/// symlinked aliases. Empty on platforms without inode identity.
+struct HomeIds {
+    home: Option<(u64, u64)>,
+    chain: HashSet<(u64, u64)>,
+}
+
+impl HomeIds {
+    fn of(vt_home: &Path) -> Result<Self> {
+        let md =
+            fs::metadata(vt_home).with_context(|| format!("okunamadı: {}", vt_home.display()))?;
+        let chain = vt_home
+            .ancestors()
+            .filter_map(|a| fs::metadata(a).ok())
+            .filter_map(|m| identity(&m))
+            .collect();
+        Ok(Self {
+            home: identity(&md),
+            chain,
+        })
     }
-    path.to_path_buf()
+
+    /// `d` is `vt_home`, contains it, or lies inside it. `d` itself is not
+    /// followed; its ancestors are, as writes below them would be.
+    fn overlaps(&self, d: &Path) -> Result<bool> {
+        let Some(home) = self.home else {
+            return Ok(false);
+        };
+        if let Some(md) = lstat(d)?
+            && identity(&md).is_some_and(|id| self.chain.contains(&id))
+        {
+            return Ok(true);
+        }
+        Ok(d.ancestors()
+            .skip(1)
+            .filter_map(|a| fs::metadata(a).ok())
+            .any(|m| identity(&m) == Some(home)))
+    }
 }
 
 #[cfg(test)]
@@ -716,18 +790,44 @@ mod tests {
         let vt = tmp.path().join("vt");
         let theirs = tmp.path().join("theirs");
         fs::create_dir(&theirs).unwrap();
-        let mut run = Run {
-            journal: Journal::create(&vt, "s1").unwrap(),
-            backups: backup_root(&vt, "s1"),
-            host: "src",
-            report: ApplyReport::default(),
-            new_dirs: Vec::new(),
-        };
+        let mut run = Run::new(
+            Journal::create(&vt, "s1").unwrap(),
+            backup_root(&vt, "s1"),
+            "src",
+        );
         assert!(!run.mkdir(&theirs).unwrap());
         drop(run);
         let rb = rollback(&vt, "s1").unwrap();
         assert_eq!(rb.dirs_removed, 0);
         assert!(theirs.is_dir());
+    }
+
+    /// The runtime guard works on identity, independent of the file
+    /// system's name folding.
+    #[cfg(unix)]
+    #[test]
+    fn guard_blocks_paths_through_placed_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let vt = root.join("vt");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let mut run = Run::new(
+            Journal::create(&vt, "s1").unwrap(),
+            backup_root(&vt, "s1"),
+            "src",
+        );
+        assert!(run.guard(&link.join("f")).is_ok());
+        let md = fs::symlink_metadata(&link).unwrap();
+        run.placed_links.insert(identity(&md).unwrap());
+        assert!(run.guard(&link.join("a/f")).is_err());
+        assert!(run.mkdir(&link.join("a")).is_err());
+        assert!(!outside.join("a").exists());
+        // The link itself and its siblings stay writable.
+        assert!(run.guard(&link).is_ok());
+        assert!(run.guard(&root.join("other/f")).is_ok());
     }
 
     #[test]

@@ -150,3 +150,15 @@ pub(super) fn set_mode(path: &Path, mode: u32) -> Result<()> {
 pub(super) fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
+
+/// (device, inode) of the object `md` describes; spelling independent.
+#[cfg(unix)]
+pub(super) fn identity(md: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+pub(super) fn identity(_md: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}

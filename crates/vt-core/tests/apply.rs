@@ -651,7 +651,75 @@ fn keep_both_identical_variant_is_skipped() {
     let p = file_placement(&e, 1, &dest, b"source", 0o600);
     let report = apply(&plan("s1", vec![p]), &e.vt_home, &mut r).unwrap();
     assert_eq!(report.skipped_identical, 1);
+    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(report.kept_both.is_empty());
     assert_eq!(report.placed, 0);
     assert_eq!(tree(&e.dst), before);
+}
+
+/// Whether `dir`'s file system treats `a` and `b` as the same name.
+fn same_name(dir: &Path, a: &str, b: &str) -> bool {
+    let probe = dir.join("probe");
+    fs::create_dir_all(&probe).unwrap();
+    fs::write(probe.join(a), b"").unwrap();
+    let same = probe.join(b).exists();
+    fs::remove_dir_all(&probe).unwrap();
+    same
+}
+
+/// Places a symlink named `link_name` and then a file below `file_dir`, a
+/// different spelling of the same name. Wherever the file system folds the
+/// two, the write must fail and nothing may land outside.
+fn variant_escape(link_name: &str, file_dir: &str) {
+    let e = env();
+    let outside = e.blobs.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let folds = same_name(&e.blobs, link_name, file_dir);
+    let claude = e.dst.join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    let before = tree(&e.dst);
+    let p = plan(
+        "s1",
+        vec![
+            link_placement(0, &claude.join(link_name), &outside),
+            file_placement(&e, 1, &claude.join(file_dir).join("f.txt"), b"x", 0o600),
+        ],
+    );
+    let mut r = Fixed::new(Resolution::KeepSource);
+    let res = apply(&p, &e.vt_home, &mut r);
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    if !folds {
+        eprintln!("SKIPPED: file system keeps {link_name:?} and {file_dir:?} apart");
+        return;
+    }
+    let err = res.unwrap_err();
+    assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    assert_eq!(tree(&e.dst), before);
+}
+
+#[test]
+fn case_variant_of_placed_symlink_is_not_written_through() {
+    variant_escape("Escape", "escape");
+}
+
+#[test]
+fn normalization_variant_of_placed_symlink_is_not_written_through() {
+    // NFC link name, NFD directory name.
+    variant_escape("caf\u{e9}", "cafe\u{301}");
+}
+
+#[test]
+fn case_variant_of_vt_home_is_rejected() {
+    let e = env();
+    let root = e.vt_home.parent().unwrap().to_path_buf();
+    let folds = same_name(&e.blobs, "vt", "VT");
+    let p = file_placement(&e, 1, &root.join("VT/x.txt"), b"x", 0o600);
+    let mut r = Fixed::new(Resolution::KeepSource);
+    let res = apply(&plan("s1", vec![p]), &e.vt_home, &mut r);
+    if !folds {
+        eprintln!("SKIPPED: file system is case-sensitive");
+        return;
+    }
+    assert!(res.is_err());
+    assert!(!e.vt_home.join("x.txt").exists());
 }
