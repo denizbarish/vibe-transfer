@@ -77,7 +77,7 @@ pub struct Entry {
     pub size: u64,
     /// Nanoseconds since the Unix epoch.
     pub mtime_ns: i64,
-    /// POSIX mode bits; 0 on non-unix hosts.
+    /// POSIX permission bits (`& 0o7777`); 0 on non-unix hosts.
     pub mode: u32,
     /// BLAKE3 of the content; `None` for dirs and symlinks.
     #[serde(with = "hex_hash")]

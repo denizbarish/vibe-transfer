@@ -18,14 +18,32 @@ pub struct RawEntry {
     pub mode: u32,
 }
 
+/// A special file that cannot be transferred and was left out of a scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedEntry {
+    pub rel: String,
+    /// `socket`, `fifo`, `device` or `other`.
+    pub reason: String,
+}
+
+/// Result of [`scan_tree`]: transferable entries plus skipped special files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanResult {
+    pub entries: Vec<RawEntry>,
+    pub skipped: Vec<SkippedEntry>,
+}
+
 /// Walks `root` without following symlinks and returns its contents sorted
 /// by `rel`. The root itself is not included.
 ///
 /// `exclude` gets the `/`-separated NFC `rel` path; an excluded directory is
 /// skipped with its whole subtree. Symlinks are reported with their target.
-/// Sockets, FIFOs and device files are skipped. Non-UTF-8 names are an error.
-pub fn scan_tree(root: &Path, exclude: &dyn Fn(&str) -> bool) -> Result<Vec<RawEntry>> {
+/// Sockets, FIFOs and device files are not transferable: they are listed in
+/// `skipped` so callers can report them. Non-UTF-8 names are an error.
+/// `mode` holds only the permission bits (`& 0o7777`).
+pub fn scan_tree(root: &Path, exclude: &dyn Fn(&str) -> bool) -> Result<ScanResult> {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
 
     while let Some((dir, prefix)) = stack.pop() {
@@ -63,6 +81,10 @@ pub fn scan_tree(root: &Path, exclude: &dyn Fn(&str) -> bool) -> Result<Vec<RawE
             } else if ft.is_file() {
                 EntryKind::File
             } else {
+                skipped.push(SkippedEntry {
+                    rel,
+                    reason: special_kind(&md).into(),
+                });
                 continue;
             };
 
@@ -77,7 +99,31 @@ pub fn scan_tree(root: &Path, exclude: &dyn Fn(&str) -> bool) -> Result<Vec<RawE
     }
 
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(out)
+    skipped.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(ScanResult {
+        entries: out,
+        skipped,
+    })
+}
+
+#[cfg(unix)]
+fn special_kind(md: &Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    let ft = md.file_type();
+    if ft.is_socket() {
+        "socket"
+    } else if ft.is_fifo() {
+        "fifo"
+    } else if ft.is_block_device() || ft.is_char_device() {
+        "device"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(not(unix))]
+fn special_kind(_md: &Metadata) -> &'static str {
+    "other"
 }
 
 /// BLAKE3 of a file, read as a stream.
@@ -112,7 +158,7 @@ fn mtime_ns(md: &Metadata) -> Result<i64> {
 #[cfg(unix)]
 fn mode(md: &Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
-    md.mode()
+    md.mode() & 0o7777
 }
 
 #[cfg(not(unix))]

@@ -6,7 +6,7 @@ use vt_core::manifest::{
     Tool,
 };
 use vt_core::merkle::merkle_root;
-use vt_core::scan::{hash_file, scan_tree};
+use vt_core::scan::{SkippedEntry, hash_file, scan_tree};
 use vt_core::secret_types::{SecretBytes, SecretItem, SecretKind, SecretMeta};
 
 fn sample_meta() -> SecretMeta {
@@ -45,10 +45,24 @@ fn scan_preserves_symlink_and_mtime() {
     fs::write(root.join("x"), b"hello").unwrap();
     fs::create_dir(root.join("sub")).unwrap();
     fs::write(root.join("sub/a.txt"), b"abc").unwrap();
+    const KNOWN_NS: i64 = 1_700_000_000_123_456_789;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fs::File::options()
+            .write(true)
+            .open(root.join("sub/a.txt"))
+            .unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(KNOWN_NS as u64))
+            .unwrap();
+        f.set_permissions(fs::Permissions::from_mode(0o640))
+            .unwrap();
+    }
     std::os::unix::fs::symlink("../x", root.join("sub/link")).unwrap();
     fs::write(root.join("skip.tmp"), b"no").unwrap();
 
-    let entries = scan_tree(root, &|rel: &str| rel.ends_with(".tmp")).unwrap();
+    let scan = scan_tree(root, &|rel: &str| rel.ends_with(".tmp")).unwrap();
+    assert!(scan.skipped.is_empty());
+    let entries = scan.entries;
     let rels: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
     assert_eq!(rels, vec!["sub", "sub/a.txt", "sub/link", "x"]);
 
@@ -63,22 +77,39 @@ fn scan_preserves_symlink_and_mtime() {
     let file = entries.iter().find(|e| e.rel == "sub/a.txt").unwrap();
     assert_eq!(file.kind, EntryKind::File);
     assert_eq!(file.size, 3);
-    let md = fs::symlink_metadata(root.join("sub/a.txt")).unwrap();
-    let expected_ns = md
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
-    assert_eq!(file.mtime_ns, expected_ns);
-    use std::os::unix::fs::MetadataExt;
-    assert_eq!(file.mode, md.mode());
+    assert_eq!(file.mtime_ns, KNOWN_NS);
+    // Only permission bits are kept; the file type bits are masked off.
+    assert_eq!(file.mode, 0o640);
 
     let sub = entries.iter().find(|e| e.rel == "sub").unwrap();
     assert_eq!(sub.kind, EntryKind::Dir);
 
     let h = hash_file(&root.join("x")).unwrap();
     assert_eq!(h, *blake3::hash(b"hello").as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_reports_special_files_as_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("a.txt"), b"a").unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(root.join("pipe"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let scan = scan_tree(root, &|_: &str| false).unwrap();
+    let rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+    assert_eq!(rels, vec!["a.txt"]);
+    assert_eq!(
+        scan.skipped,
+        vec![SkippedEntry {
+            rel: "pipe".into(),
+            reason: "fifo".into()
+        }]
+    );
 }
 
 fn entry(index: u32, root: RootKind, rel: &str, hash: [u8; 32]) -> Entry {
@@ -91,7 +122,7 @@ fn entry(index: u32, root: RootKind, rel: &str, hash: [u8; 32]) -> Entry {
         kind: EntryKind::File,
         size: 10,
         mtime_ns: 1_700_000_000_000_000_000,
-        mode: 0o100644,
+        mode: 0o644,
         hash: Some(hash),
         partial_tail: false,
     }
