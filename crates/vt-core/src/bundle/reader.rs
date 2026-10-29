@@ -57,12 +57,12 @@ pub fn read_bundle(path: &Path, pass: &SecretString, staging: &Path) -> Result<R
 }
 
 fn read_inner(path: &Path, pass: &SecretString, blobs: &Path) -> Result<ReadBundle> {
-    let identity = age::scrypt::Identity::new(pass.clone());
+    let identity = super::identity(pass);
     let file = File::open(path).with_context(|| format!("paket açılamadı: {}", path.display()))?;
     let stream = age::Decryptor::new_buffered(BufReader::new(file))
         .and_then(|d| d.decrypt(std::iter::once(&identity as &dyn age::Identity)))
         .map_err(map_age_error)?;
-    fs::create_dir_all(blobs)
+    super::create_private_dir_all(blobs)
         .with_context(|| format!("hazırlık dizini oluşturulamadı: {}", blobs.display()))?;
 
     let mut st = State {
@@ -130,6 +130,7 @@ fn read_inner(path: &Path, pass: &SecretString, blobs: &Path) -> Result<ReadBund
 /// Checks every blob against the manifest and the stored Merkle root.
 fn verify(manifest: &Manifest, root: &[u8; 32], done: &HashMap<u32, [u8; 32]>) -> Result<()> {
     let mut indices = HashSet::new();
+    let mut file_indices = HashSet::new();
     for e in &manifest.entries {
         if !indices.insert(e.index) {
             return Err(BundleError::corrupt(format!("öğe {} iki kez", e.index)).into());
@@ -138,14 +139,26 @@ fn verify(manifest: &Manifest, root: &[u8; 32], done: &HashMap<u32, [u8; 32]>) -
             (EntryKind::File, None) => {
                 return Err(BundleError::corrupt(format!("öğe {} hash yok", e.index)).into());
             }
-            (_, Some(h)) if done.get(&e.index) != Some(&h) => {
-                return Err(BundleError::corrupt(format!("blob {}", e.index)).into());
+            (EntryKind::File, Some(h)) => {
+                if done.get(&e.index) != Some(&h) {
+                    return Err(BundleError::corrupt(format!("blob {}", e.index)).into());
+                }
+                file_indices.insert(e.index);
             }
-            _ => {}
+            (_, Some(_)) => {
+                return Err(BundleError::corrupt(format!(
+                    "öğe {} dosya değil ama hash var",
+                    e.index
+                ))
+                .into());
+            }
+            (_, None) => {}
         }
     }
-    if let Some(stray) = done.keys().find(|i| !indices.contains(i)) {
-        return Err(BundleError::corrupt(format!("manifestte olmayan blob {stray}")).into());
+    // Blobs belong to file entries only; a blob for a dir, a symlink or an
+    // unknown index is corrupt.
+    if let Some(stray) = done.keys().find(|i| !file_indices.contains(i)) {
+        return Err(BundleError::corrupt(format!("dosya öğesi olmayan blob {stray}")).into());
     }
     if merkle_root(&manifest.entries) != *root {
         return Err(BundleError::corrupt("merkle kökü").into());
@@ -241,7 +254,7 @@ impl<R: Read> State<R> {
                 return Err(BundleError::corrupt(format!("{what}, öğe {index}")).into());
             }
             let path = self.blobs.join(index.to_string());
-            let file = File::create_new(&path)
+            let file = super::create_private_file(&path)
                 .with_context(|| format!("blob yazılamadı: {}", path.display()))?;
             self.open = Some(OpenBlob {
                 index,

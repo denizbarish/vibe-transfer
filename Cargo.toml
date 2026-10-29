@@ -8,3 +8,8 @@ edition = "2024"
 rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 publish = false
+
+[profile.dev.package."*"]
+# Optimize dependencies in debug builds: bundle tests hash, compress and
+# encrypt tens of MiB.
+opt-level = 3

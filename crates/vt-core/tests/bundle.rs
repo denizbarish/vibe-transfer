@@ -300,3 +300,119 @@ fn duplicate_file_index_is_refused_by_writer() {
     w.add_file(0, &mut Cursor::new(b"a")).unwrap();
     assert!(w.add_file(0, &mut Cursor::new(b"b")).is_err());
 }
+
+#[test]
+fn create_refuses_existing_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("out.vtb");
+    fs::write(&path, b"keep me").unwrap();
+    assert!(BundleWriter::create(&path, &pass()).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"keep me");
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_and_bundle_permissions_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = tmp.path().join("out.vtb");
+    let staging = tmp.path().join("staging");
+    write_bundle(&bundle, &[("a.txt", b"transcript".to_vec())], false);
+    assert_eq!(mode(&bundle), 0o600);
+
+    let read = read_bundle(&bundle, &pass(), &staging).unwrap();
+    assert_eq!(mode(&staging), 0o700);
+    assert_eq!(mode(&read.blobs), 0o700);
+    assert_eq!(mode(&read.blobs.join("0")), 0o600);
+}
+
+#[test]
+fn blob_for_directory_entry_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = tmp.path().join("out.vtb");
+    let staging = tmp.path().join("staging");
+
+    let mut w = BundleWriter::create(&bundle, &pass()).unwrap();
+    w.add_file(0, &mut Cursor::new(b"not a dir")).unwrap();
+    let mut e = file_entry(0, "dir", 0, [0; 32]);
+    e.kind = EntryKind::Dir;
+    e.hash = None;
+    w.finish(&manifest(vec![e])).unwrap();
+
+    let err = read_bundle(&bundle, &pass(), &staging).unwrap_err();
+    assert!(matches!(bundle_err(err), BundleError::Corrupt { .. }));
+    assert!(dir_is_empty(&staging));
+}
+
+/// Inner stream frames as `(start, kind, total length with header)`.
+fn frames(inner: &[u8]) -> Vec<(usize, u8, usize)> {
+    let mut out = Vec::new();
+    let mut at = 4;
+    while at < inner.len() {
+        let len = u32::from_be_bytes(inner[at + 1..at + 5].try_into().unwrap()) as usize;
+        out.push((at, inner[at], 5 + len));
+        at += 5 + len;
+    }
+    out
+}
+
+/// Writes a one-file bundle, applies `edit` to its inner stream and reads it.
+fn read_after_tamper(edit: impl FnOnce(&mut Vec<u8>)) -> BundleError {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = tmp.path().join("out.vtb");
+    let staging = tmp.path().join("staging");
+    write_bundle(&bundle, &[("a.txt", b"hello".to_vec())], false);
+    vt_core::bundle::tamper_inner_stream(&bundle, &pass(), edit).unwrap();
+    let err = read_bundle(&bundle, &pass(), &staging).unwrap_err();
+    assert!(dir_is_empty(&staging));
+    bundle_err(err)
+}
+
+#[test]
+fn stream_without_end_is_rejected() {
+    let err = read_after_tamper(|inner| {
+        let (start, kind, _) = *frames(inner).last().unwrap();
+        assert_eq!(kind, 4);
+        inner.truncate(start);
+    });
+    assert!(matches!(err, BundleError::Corrupt { .. }), "{err:?}");
+}
+
+#[test]
+fn trailing_data_after_end_is_rejected() {
+    let err = read_after_tamper(|inner| inner.push(0));
+    assert!(matches!(err, BundleError::Corrupt { .. }), "{err:?}");
+}
+
+#[test]
+fn duplicated_segment_is_rejected() {
+    let err = read_after_tamper(|inner| {
+        let (start, kind, len) = frames(inner)[0];
+        assert_eq!(kind, 1);
+        let copy = inner[start..start + len].to_vec();
+        inner.splice(start + len..start + len, copy);
+    });
+    assert_eq!(
+        err,
+        BundleError::Corrupt {
+            what: "segment 1".into()
+        }
+    );
+}
+
+#[test]
+fn oversized_frame_is_rejected() {
+    let err = read_after_tamper(|inner| {
+        let (start, kind, _) = frames(inner)[0];
+        assert_eq!(kind, 1);
+        inner[start + 1..start + 5].copy_from_slice(&u32::MAX.to_be_bytes());
+    });
+    assert_eq!(
+        err,
+        BundleError::Corrupt {
+            what: "segment 0 boyutu".into()
+        }
+    );
+}

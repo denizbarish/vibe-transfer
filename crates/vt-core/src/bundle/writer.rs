@@ -36,9 +36,9 @@ pub struct BundleWriter {
 
 impl BundleWriter {
     pub fn create(path: &Path, pass: &SecretString) -> Result<Self> {
-        let file = File::create(path)
+        let file = super::create_private_file(path)
             .with_context(|| format!("paket oluşturulamadı: {}", path.display()))?;
-        let stream = age::Encryptor::with_user_passphrase(pass.clone())
+        let stream = super::encryptor(pass)
             .wrap_output(BufWriter::new(file))
             .context("paket şifrelemesi başlatılamadı")?;
         let mut out = HashingWriter::new(stream);
@@ -100,7 +100,7 @@ impl BundleWriter {
         serde_json::to_writer(&mut *json, item).context("sır serileştirilemedi")?;
 
         let mut sealed = Vec::new();
-        let mut enc = age::Encryptor::with_user_passphrase(self.pass.clone())
+        let mut enc = super::encryptor(&self.pass)
             .wrap_output(&mut sealed)
             .context("sır şifrelenemedi")?;
         enc.write_all(&json)?;

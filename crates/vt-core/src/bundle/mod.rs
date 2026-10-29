@@ -15,11 +15,7 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-
-use age::secrecy::SecretString;
-use anyhow::{Context, Result};
 
 use crate::manifest::Manifest;
 use crate::secret_types::SecretItem;
@@ -92,15 +88,61 @@ impl fmt::Display for BundleError {
 
 impl std::error::Error for BundleError {}
 
+/// scrypt cost (log2 N) used when writing. Pinned instead of age's per-call
+/// timing calibration so a loaded or slow machine still opens the bundle:
+/// 2^18 is 256 MiB of memory, about a second on a laptop.
+pub(crate) const SCRYPT_LOG_N: u8 = 18;
+/// Highest scrypt cost the reader accepts (2^20, 1 GiB), bounding the work a
+/// crafted bundle can demand.
+pub(crate) const SCRYPT_MAX_LOG_N: u8 = 20;
+
+/// age encryptor for `pass` with the pinned scrypt cost.
+pub(crate) fn encryptor(pass: &age::secrecy::SecretString) -> age::Encryptor {
+    let mut recipient = age::scrypt::Recipient::new(pass.clone());
+    recipient.set_work_factor(SCRYPT_LOG_N);
+    age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+        .expect("a single scrypt recipient is always valid")
+}
+
+/// age identity for `pass` accepting costs up to [`SCRYPT_MAX_LOG_N`].
+pub(crate) fn identity(pass: &age::secrecy::SecretString) -> age::scrypt::Identity {
+    let mut identity = age::scrypt::Identity::new(pass.clone());
+    identity.set_max_work_factor(SCRYPT_MAX_LOG_N);
+    identity
+}
+
+/// Creates a new file readable only by the owner; fails if it exists.
+pub(crate) fn create_private_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)
+}
+
+/// Creates `path` and missing parents, each new one owner-only.
+pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
+}
+
 /// Test support only: decrypts the inner stream of `path`, lets `edit` change
 /// it and re-encrypts it in place. Holds the whole bundle in memory.
+#[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub fn tamper_inner_stream(
     path: &Path,
-    pass: &SecretString,
+    pass: &age::secrecy::SecretString,
     edit: impl FnOnce(&mut Vec<u8>),
-) -> Result<()> {
-    let identity = age::scrypt::Identity::new(pass.clone());
+) -> anyhow::Result<()> {
+    use std::io::{BufReader, BufWriter, Read, Write};
+
+    use anyhow::Context;
+
+    let identity = identity(pass);
     let decryptor = age::Decryptor::new_buffered(BufReader::new(File::open(path)?))?;
     let mut inner = Vec::new();
     decryptor
@@ -108,7 +150,7 @@ pub fn tamper_inner_stream(
         .read_to_end(&mut inner)?;
     edit(&mut inner);
 
-    let encryptor = age::Encryptor::with_user_passphrase(pass.clone());
+    let encryptor = encryptor(pass);
     let mut out = encryptor.wrap_output(BufWriter::new(File::create(path)?))?;
     out.write_all(&inner)?;
     out.finish()?.flush().context("paket yazılamadı")?;
