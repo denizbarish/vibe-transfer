@@ -62,6 +62,8 @@ pub(super) fn journal_path(vt_home: &Path, session: &str) -> PathBuf {
 
 pub(super) struct Journal {
     file: File,
+    /// Line number (0-based) the next appended op gets.
+    next_seq: usize,
 }
 
 impl Journal {
@@ -80,24 +82,31 @@ impl Journal {
         })?;
         sync_parent(&path);
         sync_parent(dir);
-        Ok(Self { file })
+        Ok(Self { file, next_seq: 0 })
     }
 
-    fn open(path: &Path) -> Result<Self> {
+    /// Opens a journal that already holds `lines` complete lines.
+    fn open(path: &Path, lines: usize) -> Result<Self> {
         let file = OpenOptions::new()
             .append(true)
             .open(path)
             .with_context(|| format!("açılamadı: {}", path.display()))?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            next_seq: lines,
+        })
     }
 
-    pub(super) fn append(&mut self, op: &Op) -> Result<()> {
+    /// Appends and syncs `op`; returns its line number.
+    pub(super) fn append(&mut self, op: &Op) -> Result<usize> {
         let mut line = serde_json::to_vec(op).context("günlük satırı yazılamadı")?;
         line.push(b'\n');
         self.file
             .write_all(&line)
             .and_then(|()| self.file.sync_all())
-            .context("günlük satırı yazılamadı")
+            .context("günlük satırı yazılamadı")?;
+        self.next_seq += 1;
+        Ok(self.next_seq - 1)
     }
 }
 
@@ -158,7 +167,7 @@ pub fn rollback(vt_home: &Path, session_id: &str) -> Result<RollbackReport> {
         })
         .collect();
     let aside_root = backup_root(vt_home, session_id).join("rollback");
-    let mut journal = Journal::open(&path)?;
+    let mut journal = Journal::open(&path, ops.len())?;
     let mut report = RollbackReport::default();
     for (seq, op) in ops.iter().enumerate().rev() {
         if matches!(op, Op::Undo { .. }) || undone.contains(&seq) {

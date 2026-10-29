@@ -465,3 +465,193 @@ fn reused_session_id_is_refused() {
     apply(&plan("s1", Vec::new()), &e.vt_home, &mut r).unwrap();
     assert!(apply(&plan("s1", Vec::new()), &e.vt_home, &mut r).is_err());
 }
+
+fn link_placement(index: u32, dest: &Path, target: &Path) -> Placement {
+    Placement {
+        entry_index: index,
+        blob: PathBuf::new(),
+        dest: dest.to_path_buf(),
+        kind: EntryKind::Symlink {
+            target: target.display().to_string(),
+        },
+        mtime_ns: MTIME,
+        mode: 0o777,
+        expected_hash: None,
+    }
+}
+
+fn dir_placement(index: u32, dest: &Path) -> Placement {
+    Placement {
+        entry_index: index,
+        blob: PathBuf::new(),
+        dest: dest.to_path_buf(),
+        kind: EntryKind::Dir,
+        mtime_ns: MTIME,
+        mode: 0o755,
+        expected_hash: None,
+    }
+}
+
+#[test]
+fn plan_rejects_dest_below_planned_symlink() {
+    let e = env();
+    let outside = e.blobs.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let link = e.dst.join(".claude/escape");
+    let mut r = Fixed::new(Resolution::KeepSource);
+
+    let p = plan(
+        "s1",
+        vec![
+            link_placement(0, &link, &outside),
+            file_placement(&e, 1, &link.join("f.txt"), b"x", 0o600),
+        ],
+    );
+    let err = apply(&p, &e.vt_home, &mut r).unwrap_err();
+    assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+
+    let mut p = plan("s2", vec![link_placement(0, &link, &outside)]);
+    p.json_writes.push((link.join("x.json"), json!({})));
+    assert!(apply(&p, &e.vt_home, &mut r).is_err());
+
+    let mut p = plan("s3", vec![link_placement(0, &link, &outside)]);
+    p.replace_scopes.push(ReplaceScope {
+        dir: link.join("sub"),
+        keep: BTreeSet::new(),
+    });
+    assert!(apply(&p, &e.vt_home, &mut r).is_err());
+
+    assert!(fs::read_dir(&e.dst).unwrap().next().is_none());
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    assert!(!e.vt_home.join("journal/s1.jsonl").exists());
+}
+
+#[test]
+fn plan_rejects_paths_overlapping_vt_home() {
+    let e = env();
+    let mut r = Fixed::new(Resolution::KeepSource);
+    let inside = file_placement(&e, 1, &e.vt_home.join("backups/x"), b"x", 0o600);
+    assert!(apply(&plan("s1", vec![inside]), &e.vt_home, &mut r).is_err());
+    let mut p = plan("s2", Vec::new());
+    p.replace_scopes.push(ReplaceScope {
+        dir: e.vt_home.parent().unwrap().to_path_buf(),
+        keep: BTreeSet::new(),
+    });
+    assert!(apply(&p, &e.vt_home, &mut r).is_err());
+    let mut p = plan("s3", Vec::new());
+    p.json_writes.push((e.vt_home.clone(), json!({})));
+    assert!(apply(&p, &e.vt_home, &mut r).is_err());
+    // Through a symlinked alias of vt_home as well.
+    let alias = e.dst.join("alias");
+    fs::create_dir_all(&e.vt_home).unwrap();
+    symlink(&e.vt_home, &alias).unwrap();
+    let p = file_placement(&e, 2, &alias.join("x"), b"x", 0o600);
+    assert!(apply(&plan("s4", vec![p]), &e.vt_home, &mut r).is_err());
+    assert!(!e.vt_home.join("x").exists());
+}
+
+#[test]
+fn dir_placement_on_symlink_to_dir_is_used_as_is() {
+    let e = env();
+    let stow = e.dst.join("stow/claude");
+    fs::create_dir_all(&stow).unwrap();
+    let claude = e.dst.join(".claude");
+    symlink(&stow, &claude).unwrap();
+    let before = tree(&e.dst);
+
+    let p = plan(
+        "s1",
+        vec![
+            dir_placement(0, &claude),
+            file_placement(&e, 1, &claude.join("a.txt"), b"a", 0o600),
+        ],
+    );
+    let mut r = Fixed::new(Resolution::KeepSource);
+    let report = apply(&p, &e.vt_home, &mut r).unwrap();
+    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+    assert!(
+        fs::symlink_metadata(&claude)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(stow.join("a.txt")).unwrap(), b"a");
+    let journal = fs::read_to_string(e.vt_home.join("journal/s1.jsonl")).unwrap();
+    assert!(!journal.contains(r#""op":"mkdir""#), "{journal}");
+
+    rollback(&e.vt_home, "s1").unwrap();
+    assert_eq!(tree(&e.dst), before);
+}
+
+#[test]
+fn dir_placement_on_symlink_to_file_backs_it_up() {
+    let e = env();
+    let file = e.dst.join("real.txt");
+    write_with(&file, b"real", 0o644, MTIME);
+    let dest = e.dst.join("d");
+    symlink(&file, &dest).unwrap();
+    let before = tree(&e.dst);
+
+    let mut r = Fixed::new(Resolution::KeepSource);
+    let report = apply(
+        &plan("s1", vec![dir_placement(0, &dest)]),
+        &e.vt_home,
+        &mut r,
+    )
+    .unwrap();
+    assert!(fs::symlink_metadata(&dest).unwrap().is_dir());
+    assert_eq!(report.backed_up, vec![dest.clone()]);
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(fs::read_link(backup_of(&e, "s1", &dest)).unwrap(), file);
+
+    rollback(&e.vt_home, "s1").unwrap();
+    assert_eq!(tree(&e.dst), before);
+}
+
+#[test]
+fn symlinked_replace_scope_is_not_cleared() {
+    let e = env();
+    let real = e.dst.join("stow/skills");
+    write_with(&real.join("mine.md"), b"mine", 0o644, MTIME);
+    let scope = e.dst.join(".claude/skills");
+    fs::create_dir_all(scope.parent().unwrap()).unwrap();
+    symlink(&real, &scope).unwrap();
+    let before = tree(&e.dst);
+
+    let mut p = plan("s1", Vec::new());
+    p.replace_scopes.push(ReplaceScope {
+        dir: scope.clone(),
+        keep: BTreeSet::new(),
+    });
+    let mut r = Fixed::new(Resolution::KeepSource);
+    let report = apply(&p, &e.vt_home, &mut r).unwrap();
+    assert_eq!(tree(&e.dst), before);
+    assert!(report.backed_up.is_empty());
+    assert_eq!(report.conflicts.len(), 1);
+    assert!(
+        report.conflicts[0].contains("replace kapsamı symlink, temizlenmedi"),
+        "{:?}",
+        report.conflicts
+    );
+}
+
+#[test]
+fn keep_both_identical_variant_is_skipped() {
+    let e = env();
+    let dest = e.dst.join("settings.json");
+    write_with(&dest, b"target", 0o644, MTIME);
+    write_with(
+        &e.dst.join("settings.from-src.json"),
+        b"source",
+        0o644,
+        MTIME,
+    );
+    let before = tree(&e.dst);
+    let mut r = Fixed::new(Resolution::KeepBoth);
+    let p = file_placement(&e, 1, &dest, b"source", 0o600);
+    let report = apply(&plan("s1", vec![p]), &e.vt_home, &mut r).unwrap();
+    assert_eq!(report.skipped_identical, 1);
+    assert!(report.kept_both.is_empty());
+    assert_eq!(report.placed, 0);
+    assert_eq!(tree(&e.dst), before);
+}

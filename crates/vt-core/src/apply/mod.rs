@@ -93,7 +93,7 @@ pub fn apply(
     resolver: &mut dyn ConflictResolver,
 ) -> Result<ApplyReport> {
     validate_session(&plan.session_id)?;
-    validate_plan(plan)?;
+    validate_plan(plan, vt_home)?;
     let journal = Journal::create(vt_home, &plan.session_id)?;
     let mut run = Run {
         journal,
@@ -106,13 +106,32 @@ pub fn apply(
         Ok(()) => Ok(run.report),
         Err(e) => {
             drop(run);
-            match rollback(vt_home, &plan.session_id) {
-                Ok(_) => Err(e.context("uygulama başarısız, değişiklikler geri alındı")),
-                Err(re) => Err(e.context(format!(
-                    "uygulama başarısız, geri alma da başarısız: {re:#}"
-                ))),
-            }
+            Err(failure(e, rollback(vt_home, &plan.session_id)))
         }
+    }
+}
+
+/// The apply error plus what the automatic rollback did: its own error,
+/// or the user objects it moved aside instead of deleting.
+fn failure(e: anyhow::Error, rolled: Result<RollbackReport>) -> anyhow::Error {
+    match rolled {
+        Ok(rb) if rb.set_aside.is_empty() => {
+            e.context("uygulama başarısız, değişiklikler geri alındı")
+        }
+        Ok(rb) => {
+            let paths: Vec<String> = rb
+                .set_aside
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            e.context(format!(
+                "uygulama başarısız, değişiklikler geri alındı; değişmiş öğeler kenara alındı: {}",
+                paths.join(", ")
+            ))
+        }
+        Err(re) => e.context(format!(
+            "uygulama başarısız, geri alma da başarısız: {re:#}"
+        )),
     }
 }
 
@@ -149,9 +168,17 @@ impl Run<'_> {
     }
 
     fn clear_scope(&mut self, scope: &ReplaceScope) -> Result<()> {
-        // A symlinked or missing scope dir is not entered.
+        // A missing scope dir has nothing to clear; a symlinked one is user
+        // setup and is neither followed nor cleared.
         match lstat(&scope.dir)? {
             Some(md) if md.is_dir() => {}
+            Some(md) if md.file_type().is_symlink() => {
+                self.report.conflicts.push(format!(
+                    "replace kapsamı symlink, temizlenmedi: {}",
+                    scope.dir.display()
+                ));
+                return Ok(());
+            }
             _ => return Ok(()),
         }
         let mut victims = Vec::new();
@@ -176,7 +203,7 @@ impl Run<'_> {
             None => (p.dest.clone(), None),
             Some(md) if md.is_dir() => bail!("hedefte aynı adla bir dizin var"),
             Some(md) => {
-                if is_identical(p, &md)? {
+                if is_identical(p, &p.dest, &md)? {
                     self.report.skipped_identical += 1;
                     return Ok(());
                 }
@@ -187,7 +214,10 @@ impl Run<'_> {
                 match res {
                     Resolution::KeepTarget => return Ok(()),
                     Resolution::KeepBoth => {
-                        let t = self.free_keep_both_name(&p.dest)?;
+                        let Some(t) = self.free_keep_both_name(p)? else {
+                            self.report.skipped_identical += 1;
+                            return Ok(());
+                        };
                         self.report.kept_both.push(t.clone());
                         (t, None)
                     }
@@ -210,17 +240,29 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// A pre-existing dir, or symlink to a dir (user setup such as a
+    /// stow-managed tree), is used as is. A symlink to anything else is
+    /// backed up like a file and replaced by the directory.
     fn place_dir(&mut self, p: &Placement) -> Result<()> {
         match lstat(&p.dest)? {
             Some(md) if md.is_dir() => return Ok(()),
+            Some(md) if md.file_type().is_symlink() => {
+                if fs::metadata(&p.dest).is_ok_and(|m| m.is_dir()) {
+                    return Ok(());
+                }
+                self.report.conflicts.push(format!(
+                    "{}: dizin yerinde symlink vardı, yedeklendi",
+                    p.dest.display()
+                ));
+                self.backup(&p.dest)?;
+            }
             Some(_) => bail!("hedefte dizin yerine başka bir öğe var"),
             None => {}
         }
         self.ensure_parent(&p.dest)?;
-        self.journal.append(&Op::Mkdir {
-            dest: p.dest.clone(),
-        })?;
-        fs::create_dir(&p.dest).with_context(|| format!("oluşturulamadı: {}", p.dest.display()))?;
+        if !self.mkdir(&p.dest)? {
+            return Ok(());
+        }
         if p.mode != 0 {
             set_mode(&p.dest, p.mode & 0o777)?;
         }
@@ -374,27 +416,43 @@ impl Run<'_> {
             .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
             .collect();
         for dir in missing.into_iter().rev() {
-            self.journal.append(&Op::Mkdir {
-                dest: dir.to_path_buf(),
-            })?;
-            match fs::create_dir(dir) {
-                Err(e) if e.kind() != ErrorKind::AlreadyExists => {
-                    return Err(e).with_context(|| format!("oluşturulamadı: {}", dir.display()));
-                }
-                _ => sync_parent(dir),
-            }
+            self.mkdir(dir)?;
         }
         Ok(())
     }
 
-    fn free_keep_both_name(&self, dest: &Path) -> Result<PathBuf> {
+    /// Journals and creates `dir`; returns `false` if something appeared
+    /// there meanwhile. That `mkdir` line is then marked undone at once, so
+    /// rollback never removes a directory this session did not create.
+    fn mkdir(&mut self, dir: &Path) -> Result<bool> {
+        let seq = self.journal.append(&Op::Mkdir {
+            dest: dir.to_path_buf(),
+        })?;
+        match fs::create_dir(dir) {
+            Ok(()) => {
+                sync_parent(dir);
+                Ok(true)
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                self.journal.append(&Op::Undo { seq })?;
+                Ok(false)
+            }
+            Err(e) => Err(e).with_context(|| format!("oluşturulamadı: {}", dir.display())),
+        }
+    }
+
+    /// First free `KeepBoth` name for `p`, or `None` when an earlier
+    /// `KeepBoth` copy already holds the same content.
+    fn free_keep_both_name(&self, p: &Placement) -> Result<Option<PathBuf>> {
         for n in 1..10_000 {
-            let candidate = conflict::keep_both_name(dest, self.host, n);
-            if lstat(&candidate)?.is_none() {
-                return Ok(candidate);
+            let candidate = conflict::keep_both_name(&p.dest, self.host, n);
+            match lstat(&candidate)? {
+                None => return Ok(Some(candidate)),
+                Some(md) if is_identical(p, &candidate, &md)? => return Ok(None),
+                Some(_) => {}
             }
         }
-        bail!("boş ad bulunamadı: {}", dest.display())
+        bail!("boş ad bulunamadı: {}", p.dest.display())
     }
 }
 
@@ -406,8 +464,8 @@ fn describe(res: Resolution) -> &'static str {
     }
 }
 
-/// Same content at `p.dest` (`md` is its lstat) as the placement brings.
-fn is_identical(p: &Placement, md: &fs::Metadata) -> Result<bool> {
+/// Same content at `at` (`md` is its lstat) as the placement brings.
+fn is_identical(p: &Placement, at: &Path, md: &fs::Metadata) -> Result<bool> {
     match &p.kind {
         EntryKind::File => {
             if !md.is_file() {
@@ -423,11 +481,10 @@ fn is_identical(p: &Placement, md: &fs::Metadata) -> Result<bool> {
                 Some(h) => h,
                 None => hash_file(&p.blob)?,
             };
-            Ok(hash_file(&p.dest)? == source)
+            Ok(hash_file(at)? == source)
         }
         EntryKind::Symlink { target } => Ok(md.file_type().is_symlink()
-            && fs::read_link(&p.dest)
-                .with_context(|| format!("okunamadı: {}", p.dest.display()))?
+            && fs::read_link(at).with_context(|| format!("okunamadı: {}", at.display()))?
                 == Path::new(target)),
         EntryKind::Dir => Ok(md.is_dir()),
     }
@@ -493,9 +550,17 @@ pub(crate) fn validate_session(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every target path must be absolute and free of `..`, so nothing can
-/// reach outside the place the caller computed.
-fn validate_plan(plan: &ApplyPlan) -> Result<()> {
+/// Rejects, before anything is written, a plan that could reach outside
+/// the place the caller computed: relative paths or `..`, a path below a
+/// symlink the same plan places, or a path overlapping `vt_home`.
+fn validate_plan(plan: &ApplyPlan, vt_home: &Path) -> Result<()> {
+    let links: BTreeSet<&Path> = plan
+        .placements
+        .iter()
+        .filter(|p| matches!(p.kind, EntryKind::Symlink { .. }))
+        .map(|p| p.dest.as_path())
+        .collect();
+    let home = resolve(vt_home);
     let dests = plan
         .placements
         .iter()
@@ -509,8 +574,40 @@ fn validate_plan(plan: &ApplyPlan) -> Result<()> {
         if !clean {
             bail!("geçersiz hedef yolu: {}", d.display());
         }
+        if let Some(link) = d.ancestors().skip(1).find(|a| links.contains(a)) {
+            bail!(
+                "hedef, aynı planın yerleştirdiği symlink altında: {} ({})",
+                d.display(),
+                link.display()
+            );
+        }
+        // The dest itself is never followed, only its ancestors.
+        let rd = match (d.parent(), d.file_name()) {
+            (Some(parent), Some(name)) => resolve(parent).join(name),
+            _ => d.clone(),
+        };
+        let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+        if overlaps(d, vt_home) || overlaps(&rd, &home) {
+            bail!("hedef vibe-transfer dizini ile çakışıyor: {}", d.display());
+        }
     }
     Ok(())
+}
+
+/// `path` with its deepest existing ancestor canonicalized (symlinks and
+/// `/var` style aliases resolved), the missing rest appended as is.
+fn resolve(path: &Path) -> PathBuf {
+    for base in path.ancestors() {
+        if let Ok(real) = base.canonicalize() {
+            let rest = path.strip_prefix(base).unwrap_or(Path::new(""));
+            return if rest.as_os_str().is_empty() {
+                real
+            } else {
+                real.join(rest)
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -609,6 +706,55 @@ mod tests {
         assert!(!dest.exists());
         assert_eq!(rb.set_aside.len(), 1);
         assert_eq!(fs::read(&rb.set_aside[0]).unwrap(), b"user edit");
+    }
+
+    /// A dir that appears between the check and `create_dir` is not
+    /// removed by rollback.
+    #[test]
+    fn mkdir_of_existing_dir_is_not_rolled_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vt = tmp.path().join("vt");
+        let theirs = tmp.path().join("theirs");
+        fs::create_dir(&theirs).unwrap();
+        let mut run = Run {
+            journal: Journal::create(&vt, "s1").unwrap(),
+            backups: backup_root(&vt, "s1"),
+            host: "src",
+            report: ApplyReport::default(),
+            new_dirs: Vec::new(),
+        };
+        assert!(!run.mkdir(&theirs).unwrap());
+        drop(run);
+        let rb = rollback(&vt, "s1").unwrap();
+        assert_eq!(rb.dirs_removed, 0);
+        assert!(theirs.is_dir());
+    }
+
+    #[test]
+    fn failure_lists_set_aside_objects() {
+        let ok = failure(
+            anyhow::anyhow!("asıl hata"),
+            Ok(RollbackReport {
+                set_aside: vec![PathBuf::from("/vt/backups/s1/rollback/abs/x")],
+                ..RollbackReport::default()
+            }),
+        );
+        let text = format!("{ok:#}");
+        assert!(text.contains("asıl hata"), "{text}");
+        assert!(
+            text.contains("kenara alındı: /vt/backups/s1/rollback/abs/x"),
+            "{text}"
+        );
+        let clean = format!(
+            "{:#}",
+            failure(anyhow::anyhow!("asıl hata"), Ok(RollbackReport::default()))
+        );
+        assert!(!clean.contains("kenara"), "{clean}");
+        let failed = failure(
+            anyhow::anyhow!("asıl hata"),
+            Err(anyhow::anyhow!("disk dolu")),
+        );
+        assert!(format!("{failed:#}").contains("disk dolu"));
     }
 
     #[test]
