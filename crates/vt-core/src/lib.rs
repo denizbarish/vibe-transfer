@@ -1,5 +1,6 @@
 //! Core types shared by all vibe-transfer adapters.
 
+pub mod apply;
 pub mod bundle;
 pub mod env;
 pub mod fsutil;
