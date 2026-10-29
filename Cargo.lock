@@ -1753,6 +1753,7 @@ dependencies = [
  "anyhow",
  "serde_json",
  "tempfile",
+ "unicode-normalization",
  "vt-core",
 ]
 
