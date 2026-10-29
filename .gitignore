@@ -1,0 +1,17 @@
+/target/
+**/*.rs.bk
+
+# Machine-specific research notes (contain local paths and project names)
+/docs/research/
+
+# Agent workspaces
+/.superpowers/
+
+# Transfer artifacts must never be committed
+*.vtb
+*.age
+.vibe-transfer/
+
+.env
+.env.*
+.DS_Store
