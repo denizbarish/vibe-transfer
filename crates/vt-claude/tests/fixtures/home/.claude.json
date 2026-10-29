@@ -1,0 +1,9 @@
+{
+  "projects": {
+    "@HOME@/code/app": {"allowedTools": []},
+    "/Users/src/plain": {"allowedTools": []}
+  },
+  "githubRepoPaths": {
+    "acme/app": ["@HOME@/code/app"]
+  }
+}
