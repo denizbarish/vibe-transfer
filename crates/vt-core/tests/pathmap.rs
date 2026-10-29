@@ -153,6 +153,50 @@ fn map_outside_home_pending() {
 }
 
 #[test]
+fn map_root_or_empty_home_never_rewrites() {
+    let r = plain_ref("/private/tmp/x/vt-nonexistent-acme");
+    for home in ["/", "", "//"] {
+        assert_eq!(
+            map_project(&r, &TargetIndex::default(), home, Path::new("/Users/dst")),
+            Mapping::Pending,
+            "src_home={home:?}"
+        );
+    }
+}
+
+#[test]
+fn map_relative_or_dotdot_path_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("acme");
+    fs::create_dir(&real).unwrap();
+    let dotdot = format!("{}/acme/../acme", tmp.path().display());
+    for old in [
+        "relative/acme",
+        "/Users/src/../bob/acme",
+        "/Users/src/a/../../x",
+        dotdot.as_str(),
+    ] {
+        assert_eq!(
+            map_project(
+                &plain_ref(old),
+                &TargetIndex::default(),
+                "/Users/src",
+                Path::new("/Users/dst")
+            ),
+            Mapping::Pending,
+            "old_path={old}"
+        );
+    }
+}
+
+#[test]
+fn rewrite_home_root_or_empty_is_noop() {
+    let s = "bash /Users/alice/h.sh \"/x\" '/' /";
+    assert_eq!(rewrite_home(s, "/", "/Users/bob"), s);
+    assert_eq!(rewrite_home(s, "", "/Users/bob"), s);
+}
+
+#[test]
 fn rewrite_home_boundary() {
     let src = "/Users/alice";
     let dst = "/Users/bob";
@@ -223,6 +267,21 @@ fn target_index_prunes_and_stops_at_repo() {
 
     let deep = build_target_index(&[home.to_path_buf()], 3);
     assert!(deep.by_remote.contains_key("github.com/acme/deep"));
+}
+
+#[test]
+fn target_index_prunes_library_only_at_top() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    make_repo(&home.join("Library/x"), "https://github.com/acme/lib");
+    make_repo(
+        &home.join("code/Library"),
+        "https://github.com/acme/codelib",
+    );
+    make_repo(&home.join("code/.Trash/x"), "https://github.com/acme/trash");
+    let idx = build_target_index(&[home.to_path_buf()], 5);
+    let keys: Vec<&str> = idx.by_remote.keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["github.com/acme/codelib"]);
 }
 
 #[cfg(unix)]

@@ -2,14 +2,19 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::manifest::ProjectRef;
 use crate::remote::{normalize_remote, read_origin};
 
 /// Directory names never descended into while indexing the target.
-/// Hidden names (leading `.`, e.g. `.Trash`) are skipped as well.
-const PRUNED_NAMES: &[&str] = &["node_modules", "Library"];
+/// Hidden names (leading `.`, e.g. `.Trash`) are skipped at every depth too.
+const PRUNED_NAMES: &[&str] = &["node_modules"];
+
+/// Names skipped only directly under an index root (the home folder):
+/// `~/Library` is huge and partly privacy-protected on macOS, while a
+/// project folder named `Library` deeper down is still indexed.
+const PRUNED_TOP_NAMES: &[&str] = &["Library"];
 
 /// Git repositories on the target, keyed by normalized `origin` remote.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,6 +30,7 @@ pub struct TargetIndex {
 /// each root (the root itself is depth 0). Symlinks are never followed,
 /// pruned and hidden directories are skipped, unreadable directories are
 /// counted in `skipped_dirs`, and a repository root is not descended into.
+/// `Library` is pruned only directly under each root.
 pub fn build_target_index(roots: &[PathBuf], max_depth: usize) -> TargetIndex {
     let mut idx = TargetIndex::default();
     for root in roots {
@@ -69,7 +75,10 @@ fn visit(dir: &Path, depth: usize, max_depth: usize, idx: &mut TargetIndex) {
             visit(&entry.path(), depth + 1, max_depth, idx);
             continue;
         };
-        if name.starts_with('.') || PRUNED_NAMES.contains(&name) {
+        if name.starts_with('.')
+            || PRUNED_NAMES.contains(&name)
+            || (depth == 0 && PRUNED_TOP_NAMES.contains(&name))
+        {
             continue;
         }
         visit(&entry.path(), depth + 1, max_depth, idx);
@@ -99,8 +108,11 @@ pub fn map_project(r: &ProjectRef, idx: &TargetIndex, src_home: &str, dst_home: 
     if r.is_git {
         return Mapping::Pending;
     }
-    let src_home = trim_home(src_home);
-    if let Some(rest) = strip_home(&r.old_path, src_home) {
+    let old = Path::new(&r.old_path);
+    if !old.is_absolute() || old.components().any(|c| c == Component::ParentDir) {
+        return Mapping::Pending;
+    }
+    if let Some(rest) = usable_home(src_home).and_then(|home| strip_home(&r.old_path, home)) {
         let rest = rest.trim_start_matches('/');
         return Mapping::Auto(if rest.is_empty() {
             dst_home.to_path_buf()
@@ -108,20 +120,23 @@ pub fn map_project(r: &ProjectRef, idx: &TargetIndex, src_home: &str, dst_home: 
             dst_home.join(rest)
         });
     }
-    let same = Path::new(&r.old_path);
-    if same.is_absolute() && same.is_dir() {
-        return Mapping::Auto(same.to_path_buf());
+    if old.is_dir() {
+        return Mapping::Auto(old.to_path_buf());
     }
     Mapping::Pending
 }
 
 /// `path` relative to `home` when it is `home` itself or below it.
 fn strip_home<'a>(path: &'a str, home: &str) -> Option<&'a str> {
-    if home.is_empty() {
-        return None;
-    }
     let rest = path.strip_prefix(home)?;
-    (rest.is_empty() || rest.starts_with('/') || home == "/").then_some(rest)
+    (rest.is_empty() || rest.starts_with('/')).then_some(rest)
+}
+
+/// `home` without one trailing `/`; `None` for an empty or root home,
+/// which would match every path, so no home rewriting applies.
+fn usable_home(home: &str) -> Option<&str> {
+    let home = trim_home(home);
+    (!home.is_empty() && home != "/").then_some(home)
 }
 
 /// Drops one trailing `/`, except for the root itself.
@@ -134,13 +149,13 @@ fn trim_home(home: &str) -> &str {
 
 /// Replaces `src_home` with `dst_home` wherever the character after it is
 /// `/`, `"`, `'`, a space, or the end of the string. Other occurrences
-/// (e.g. `/Users/alice2` for `/Users/alice`) stay untouched.
+/// (e.g. `/Users/alice2` for `/Users/alice`) stay untouched. An empty or
+/// root `src_home` rewrites nothing.
 pub fn rewrite_home(s: &str, src_home: &str, dst_home: &str) -> String {
-    let src = trim_home(src_home);
-    let dst = trim_home(dst_home);
-    if src.is_empty() {
+    let Some(src) = usable_home(src_home) else {
         return s.to_owned();
-    }
+    };
+    let dst = trim_home(dst_home);
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find(src) {

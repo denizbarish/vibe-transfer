@@ -4,6 +4,7 @@
 //! `blobs/<put nonce>-<entry index>`. Directories are owner-only (0700),
 //! `pending.json` is 0600; blobs keep their original mode and mtime.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -55,8 +56,16 @@ impl PendingStore {
     /// Adds `items` for `project`, moving each blob into the store (renamed
     /// on the same file system; otherwise copied and the source left for
     /// the caller). Existing pending data of the project is kept and the new
-    /// items are appended.
+    /// items are appended. Empty `items` is a no-op.
+    ///
+    /// On failure every blob already moved is rolled back to its source
+    /// (renames are reversed, copies removed). A crash between moving blobs
+    /// and writing `pending.json` can leave unreferenced blobs or a temp
+    /// record behind; `list_orphans` reports them, so nothing is unreachable.
     pub fn put(&self, project: &ProjectRef, items: &[PendingItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
         let project_dir = self.project_dir(&project.id);
         let blobs = project_dir.join(BLOBS_DIR);
         create_private_dir_all(&blobs)
@@ -77,26 +86,74 @@ impl PendingStore {
         }
 
         let nonce = nonce_hex();
-        for (moved, item) in items.iter().enumerate() {
-            let name = format!("{nonce}-{}", item.entry.index);
-            if let Err(e) = move_blob(&item.blob, &blobs.join(&name)) {
-                // Record the blobs already moved so none is orphaned.
-                if moved > 0 {
-                    write_json_atomic(&project_dir, &stored, &nonce)?;
-                }
-                return Err(e);
+        let mut moved: Vec<Moved> = Vec::with_capacity(items.len());
+        let result = (|| -> Result<()> {
+            for item in items {
+                let name = format!("{nonce}-{}", item.entry.index);
+                let dst = blobs.join(&name);
+                let renamed = move_blob(&item.blob, &dst)?;
+                moved.push(Moved {
+                    src: item.blob.clone(),
+                    dst,
+                    renamed,
+                });
+                stored.items.push(PendingItem {
+                    entry: item.entry.clone(),
+                    blob: Path::new(BLOBS_DIR).join(name),
+                    dest_template: item.dest_template.clone(),
+                });
             }
-            stored.items.push(PendingItem {
-                entry: item.entry.clone(),
-                blob: Path::new(BLOBS_DIR).join(name),
-                dest_template: item.dest_template.clone(),
-            });
+            write_json_atomic(&project_dir, &stored, &nonce)
+        })();
+        let Err(err) = result else { return Ok(()) };
+        let rollback_errors = roll_back(&moved);
+        // Leaves a folder created only for this call; fails harmlessly if
+        // it holds anything.
+        let _ = fs::remove_dir(&blobs);
+        let _ = fs::remove_dir(&project_dir);
+        if rollback_errors.is_empty() {
+            Err(err)
+        } else {
+            Err(err.context(format!(
+                "geri alma da başarısız oldu: {}",
+                rollback_errors.join("; ")
+            )))
         }
-        write_json_atomic(&project_dir, &stored, &nonce)
     }
 
-    /// All pending projects, sorted by project id.
-    pub fn list(&self) -> Result<Vec<PendingProject>> {
+    /// Files under the store that no `pending.json` references: blobs left
+    /// by an interrupted `put` and leftover temp records. Sorted.
+    pub fn list_orphans(&self) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        for project_dir in self.project_dirs()? {
+            let referenced: HashSet<PathBuf> = match self.load(&project_dir)? {
+                Some(project) => project.items.into_iter().map(|i| i.blob).collect(),
+                None => HashSet::new(),
+            };
+            for path in read_dir_paths(&project_dir)? {
+                let is_tmp = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&format!("{PENDING_JSON}.tmp-")));
+                if is_tmp {
+                    out.push(path);
+                }
+            }
+            let blobs = project_dir.join(BLOBS_DIR);
+            if blobs.is_dir() {
+                for path in read_dir_paths(&blobs)? {
+                    if !referenced.contains(&path) {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Project folders under `dir`; none when `dir` does not exist.
+    fn project_dirs(&self) -> Result<Vec<PathBuf>> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -109,10 +166,21 @@ impl PendingStore {
         for entry in entries {
             let entry = entry
                 .with_context(|| format!("bekleme alanı okunamadı: {}", self.dir.display()))?;
-            if !entry.file_type()?.is_dir() {
-                continue;
+            let ft = entry
+                .file_type()
+                .with_context(|| format!("okunamadı: {}", entry.path().display()))?;
+            if ft.is_dir() {
+                out.push(entry.path());
             }
-            if let Some(project) = self.load(&entry.path())? {
+        }
+        Ok(out)
+    }
+
+    /// All pending projects, sorted by project id.
+    pub fn list(&self) -> Result<Vec<PendingProject>> {
+        let mut out = Vec::new();
+        for project_dir in self.project_dirs()? {
+            if let Some(project) = self.load(&project_dir)? {
                 out.push(project);
             }
         }
@@ -170,21 +238,66 @@ fn nonce_hex() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Moves `src` to `dst` by rename; across file systems copies instead,
-/// keeping mode and mtime, and leaves `src` in place.
-fn move_blob(src: &Path, dst: &Path) -> Result<()> {
+/// A blob moved by the current `put`, kept for rollback.
+struct Moved {
+    src: PathBuf,
+    dst: PathBuf,
+    /// `true` when renamed (source gone), `false` when copied.
+    renamed: bool,
+}
+
+/// Undoes `moved` in reverse order; returns the errors it hit.
+fn roll_back(moved: &[Moved]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for m in moved.iter().rev() {
+        let result = if m.renamed {
+            fs::rename(&m.dst, &m.src)
+        } else {
+            fs::remove_file(&m.dst)
+        };
+        if let Err(e) = result {
+            errors.push(format!("{}: {e}", m.dst.display()));
+        }
+    }
+    errors
+}
+
+fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = fs::read_dir(dir).with_context(|| format!("okunamadı: {}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        out.push(
+            entry
+                .with_context(|| format!("okunamadı: {}", dir.display()))?
+                .path(),
+        );
+    }
+    Ok(out)
+}
+
+/// Moves `src` to `dst` by rename (returns `true`); across file systems
+/// copies instead, keeping mode and mtime, and leaves `src` in place
+/// (returns `false`).
+fn move_blob(src: &Path, dst: &Path) -> Result<bool> {
     match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::CrossesDevices => copy_blob(src, dst),
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::CrossesDevices => {
+            if let Err(e) = copy_blob(src, dst) {
+                // Never leave a partial copy behind.
+                let _ = fs::remove_file(dst);
+                return Err(e);
+            }
+            Ok(false)
+        }
         Err(e) => Err(e).with_context(|| format!("taşınamadı: {}", src.display())),
     }
 }
 
 fn copy_blob(src: &Path, dst: &Path) -> Result<()> {
     let md = fs::symlink_metadata(src).with_context(|| format!("okunamadı: {}", src.display()))?;
+    let mtime = filetime::FileTime::from_last_modification_time(&md);
     if md.file_type().is_symlink() {
         copy_symlink(src, dst)?;
-        let mtime = filetime::FileTime::from_last_modification_time(&md);
         filetime::set_symlink_file_times(dst, mtime, mtime)
             .with_context(|| format!("zaman ayarlanamadı: {}", dst.display()))?;
         return Ok(());
@@ -194,9 +307,12 @@ fn copy_blob(src: &Path, dst: &Path) -> Result<()> {
     }
     // `fs::copy` keeps the permission bits.
     fs::copy(src, dst).with_context(|| format!("kopyalanamadı: {}", src.display()))?;
-    let mtime = filetime::FileTime::from_last_modification_time(&md);
     filetime::set_file_mtime(dst, mtime)
         .with_context(|| format!("zaman ayarlanamadı: {}", dst.display()))?;
+    // Durable before `pending.json` references it.
+    fs::File::open(dst)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("diske yazılamadı: {}", dst.display()))?;
     Ok(())
 }
 
@@ -218,6 +334,10 @@ fn write_json_atomic(project_dir: &Path, project: &PendingProject, nonce: &str) 
     let tmp = project_dir.join(format!("{PENDING_JSON}.tmp-{nonce}"));
     let path = project_dir.join(PENDING_JSON);
     let result = (|| -> Result<()> {
+        #[cfg(test)]
+        if tests::FAIL_JSON_WRITE.get() {
+            bail!("test: yazma hatası");
+        }
         let mut file = create_private_file(&tmp)?;
         serde_json::to_writer_pretty(&mut file, project)?;
         file.flush()?;
@@ -234,4 +354,137 @@ fn write_json_atomic(project_dir: &Path, project: &PendingProject, nonce: &str) 
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::manifest::{Category, EntryKind, RootKind, Tool};
+
+    thread_local! {
+        pub(super) static FAIL_JSON_WRITE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn project() -> ProjectRef {
+        ProjectRef {
+            id: ProjectId("path:/private/tmp/acme".into()),
+            old_path: "/private/tmp/acme".into(),
+            remote: None,
+            is_git: false,
+        }
+    }
+
+    fn item(dir: &Path, index: u32, body: &[u8]) -> PendingItem {
+        let blob = dir.join(format!("src-{index}"));
+        fs::write(&blob, body).unwrap();
+        PendingItem {
+            entry: Entry {
+                index,
+                tool: Tool::Claude,
+                category: Category::Sessions,
+                root: RootKind::ClaudeDir,
+                rel: format!("{index}.jsonl"),
+                kind: EntryKind::File,
+                size: body.len() as u64,
+                mtime_ns: 0,
+                mode: 0o600,
+                hash: None,
+                partial_tail: false,
+            },
+            blob,
+            dest_template: DestTemplate::ProjectRel(format!("{index}.jsonl")),
+        }
+    }
+
+    #[test]
+    fn failed_json_write_rolls_blobs_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PendingStore {
+            dir: tmp.path().join("pending"),
+        };
+        // Existing record must survive a failed second put untouched.
+        store
+            .put(&project(), &[item(tmp.path(), 0, b"keep")])
+            .unwrap();
+
+        let items = [item(tmp.path(), 1, b"one"), item(tmp.path(), 2, b"two")];
+        FAIL_JSON_WRITE.set(true);
+        let result = store.put(&project(), &items);
+        FAIL_JSON_WRITE.set(false);
+        assert!(result.is_err());
+
+        for it in &items {
+            assert!(it.blob.exists(), "source restored: {}", it.blob.display());
+        }
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].items.len(), 1);
+        assert_eq!(fs::read(&listed[0].items[0].blob).unwrap(), b"keep");
+        assert!(store.list_orphans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_first_put_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PendingStore {
+            dir: tmp.path().join("pending"),
+        };
+        let it = item(tmp.path(), 0, b"x");
+        FAIL_JSON_WRITE.set(true);
+        assert!(store.put(&project(), std::slice::from_ref(&it)).is_err());
+        FAIL_JSON_WRITE.set(false);
+        assert!(it.blob.exists());
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(read_dir_paths(&store.dir).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn missing_source_rolls_back_earlier_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PendingStore {
+            dir: tmp.path().join("pending"),
+        };
+        let ok = item(tmp.path(), 0, b"x");
+        let mut missing = item(tmp.path(), 1, b"y");
+        missing.blob = tmp.path().join("absent");
+        assert!(store.put(&project(), &[ok.clone(), missing]).is_err());
+        assert!(ok.blob.exists());
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.list_orphans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn crash_leftovers_are_listed_as_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PendingStore {
+            dir: tmp.path().join("pending"),
+        };
+        store.put(&project(), &[item(tmp.path(), 0, b"a")]).unwrap();
+        // Simulate a crash in a later put and one in a new project.
+        let project_dir = store.project_dir(&project().id);
+        let stray = project_dir.join(BLOBS_DIR).join("ffff-9");
+        let tmp_record = project_dir.join(format!("{PENDING_JSON}.tmp-ffff"));
+        fs::write(&stray, b"lost").unwrap();
+        fs::write(&tmp_record, b"{").unwrap();
+        let other = store.dir.join("0123456789abcdef").join(BLOBS_DIR);
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("eeee-0"), b"lost too").unwrap();
+
+        let mut expected = vec![stray, tmp_record, other.join("eeee-0")];
+        expected.sort();
+        assert_eq!(store.list_orphans().unwrap(), expected);
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_put_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PendingStore {
+            dir: tmp.path().join("pending"),
+        };
+        store.put(&project(), &[]).unwrap();
+        assert!(!store.dir.exists());
+    }
 }
