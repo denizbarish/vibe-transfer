@@ -32,6 +32,9 @@ struct OutboxMeta<'a> {
     session_id: &'a str,
     created_at: &'a str,
     secrets: &'a [SecretMeta],
+    /// Secret store service of the exported Claude login, so
+    /// `logout-source` removes exactly that item.
+    secret_service: Option<String>,
     out_path: String,
 }
 
@@ -166,6 +169,10 @@ pub fn run(ctx: &Ctx, args: &ExportArgs) -> Result<()> {
     bar.finish_and_clear();
 
     let secret_metas: Vec<SecretMeta> = secrets.iter().map(|s| s.meta.clone()).collect();
+    let secret_service = secrets
+        .iter()
+        .find(|s| s.meta.kind == SecretKind::ClaudeKeychain)
+        .map(|s| s.service.clone());
     drop(secrets);
     let mut manifest_notes: Vec<String> = skipped
         .iter()
@@ -208,6 +215,7 @@ pub fn run(ctx: &Ctx, args: &ExportArgs) -> Result<()> {
                     session_id: &session_id,
                     created_at: &created_at,
                     secrets: &manifest.secrets,
+                    secret_service,
                     out_path: out_path.to_string_lossy().into_owned(),
                 },
             )?;

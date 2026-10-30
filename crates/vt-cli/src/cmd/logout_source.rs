@@ -9,6 +9,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
+use vt_claude::read_claude_json_stable;
 use vt_core::apply::validate_session;
 use vt_core::bundle::{SecretString, decrypt_file};
 use vt_core::secret_types::{SecretKind, SecretMeta};
@@ -24,6 +25,9 @@ use crate::ui;
 struct OutboxMeta {
     session_id: String,
     secrets: Vec<SecretMeta>,
+    /// Missing in records written before it was stored.
+    #[serde(default)]
+    secret_service: Option<String>,
 }
 
 pub fn run(ctx: &Ctx, args: &LogoutSourceArgs) -> Result<()> {
@@ -47,12 +51,34 @@ pub fn run(ctx: &Ctx, args: &LogoutSourceArgs) -> Result<()> {
             meta_path.display()
         );
     }
-    if !meta
+    let Some(exported) = meta
         .secrets
         .iter()
-        .any(|s| s.kind == SecretKind::ClaudeKeychain)
-    {
+        .find(|s| s.kind == SecretKind::ClaudeKeychain)
+    else {
         bail!("bu dışa aktarmada Claude giriş kaydı taşınmadı; kaldırılacak bir şey yok");
+    };
+    // The item to delete must be the one that was exported: same store
+    // service, same Claude account.
+    let service = claude_service_name(env.claude_config_dir_override.as_deref());
+    match meta.secret_service.as_deref() {
+        None => bail!(
+            "dışa aktarma kaydında sır servisi yok (eski sürüm); hangi kaydın taşındığı belirlenemiyor, hiçbir şey silinmedi"
+        ),
+        Some(s) if s != service => bail!(
+            "taşınan sır başka bir servisteydi ({}), bu ortamınki {}; hiçbir şey silinmedi",
+            ui::clean(s),
+            service
+        ),
+        Some(_) => {}
+    }
+    let current_uuid = current_account_uuid(&env.claude_json)?;
+    if current_uuid != exported.account_uuid {
+        bail!(
+            "bu makinedeki Claude hesabı ({}) dışa aktarılan hesap ({}) değil; hiçbir şey silinmedi",
+            ui::clean(current_uuid.as_deref().unwrap_or("yok")),
+            ui::clean(exported.account_uuid.as_deref().unwrap_or("yok"))
+        );
     }
     let backup_session = format!("logout-{}", args.session);
     let backup = env
@@ -71,7 +97,6 @@ pub fn run(ctx: &Ctx, args: &LogoutSourceArgs) -> Result<()> {
     ui::wait_until_closed("Claude", "Girişi kaldırmadan önce", &|| {
         ctx.claude_pids()
     })?;
-    let service = claude_service_name(env.claude_config_dir_override.as_deref());
     let account = env.user.clone();
     let Some(value) = ctx.store.get(&service, &account)? else {
         bail!("Claude giriş kaydı bulunamadı (zaten kaldırılmış olabilir): {service}");
@@ -113,6 +138,19 @@ pub fn run(ctx: &Ctx, args: &LogoutSourceArgs) -> Result<()> {
         ui::clean(&backup.display().to_string())
     );
     Ok(())
+}
+
+/// `oauthAccount.accountUuid` of the source `~/.claude.json`, if any.
+fn current_account_uuid(path: &std::path::Path) -> Result<Option<String>> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(None);
+    }
+    let doc = read_claude_json_stable(path)?;
+    Ok(doc
+        .get("oauthAccount")
+        .and_then(|a| a.get("accountUuid"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 /// The backup passphrase: typed twice on a terminal, or one line of stdin
