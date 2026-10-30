@@ -337,11 +337,13 @@ fn pending_put_list_take_roundtrip() {
         blob,
         dest_template: DestTemplate::ClaudeProjectSlugDir {
             rel_in_slug: "s.jsonl".into(),
+            subpath: None,
         },
+        source_home: None,
     }];
     store.put(&project, &items).unwrap();
 
-    let listed = store.list().unwrap();
+    let listed = store.list().unwrap().items;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].project, project);
     assert_eq!(listed[0].items.len(), 1);
@@ -359,9 +361,9 @@ fn pending_put_list_take_roundtrip() {
     );
 
     // take does not delete; remove does.
-    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(store.list().unwrap().items.len(), 1);
     store.remove(&project.id).unwrap();
-    assert!(store.list().unwrap().is_empty());
+    assert!(store.list().unwrap().items.is_empty());
     assert!(store.take(&project.id).is_err());
     // remove is idempotent.
     store.remove(&project.id).unwrap();
@@ -381,11 +383,13 @@ fn pending_put_twice_merges() {
         entry: entry(3, "a.jsonl"),
         blob: staged_blob(&staging, "first", b"one"),
         dest_template: DestTemplate::ProjectRel("a.jsonl".into()),
+        source_home: None,
     }];
     let second = vec![PendingItem {
         entry: entry(3, "b.jsonl"),
         blob: staged_blob(&staging, "second", b"two"),
         dest_template: DestTemplate::ClaudeJsonProjectsKey,
+        source_home: None,
     }];
     store.put(&project, &first).unwrap();
     store.put(&project, &second).unwrap();
@@ -416,6 +420,7 @@ fn pending_store_is_private() {
         entry: entry(0, "a"),
         blob: staged_blob(&staging, "a", b"x"),
         dest_template: DestTemplate::ProjectRel("a".into()),
+        source_home: None,
     }];
     store.put(&project, &items).unwrap();
     let project_dir = fs::read_dir(&store.dir)

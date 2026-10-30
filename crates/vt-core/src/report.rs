@@ -45,6 +45,46 @@ pub struct VerifyReport {
     /// rule or the user, replace scopes left alone (e.g. symlinked).
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Every object found as expected after the apply, with what it held;
+    /// `verify` checks these again later.
+    #[serde(default)]
+    pub files: Vec<FileRecord>,
+}
+
+/// One verified target object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRecord {
+    pub path: PathBuf,
+    #[serde(flatten)]
+    pub state: FileState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileState {
+    File {
+        #[serde(with = "hex32")]
+        hash: [u8; 32],
+    },
+    Symlink {
+        target: PathBuf,
+    },
+}
+
+/// Paths of `files` that no longer hold what was recorded (changed,
+/// replaced, or gone), in order.
+pub fn deviations(files: &[FileRecord]) -> Vec<PathBuf> {
+    files
+        .iter()
+        .filter(|f| match &f.state {
+            FileState::File { hash } => {
+                !(fs::symlink_metadata(&f.path).is_ok_and(|m| m.is_file())
+                    && hash_file(&f.path).is_ok_and(|h| h == *hash))
+            }
+            FileState::Symlink { target } => !fs::read_link(&f.path).is_ok_and(|t| t == *target),
+        })
+        .map(|f| f.path.clone())
+        .collect()
 }
 
 /// Checks every object `plan` placed. `kept_target` holds the dests where
@@ -62,64 +102,85 @@ pub fn verify_plan(
         if kept_target.contains(&p.dest) {
             continue;
         }
-        let problem = match &p.kind {
+        let found = match &p.kind {
             EntryKind::Dir => {
-                if fs::metadata(&p.dest).is_ok_and(|m| m.is_dir()) {
-                    None
-                } else {
-                    Some(format!("dizin yok: {}", p.dest.display()))
+                if !fs::metadata(&p.dest).is_ok_and(|m| m.is_dir()) {
+                    report
+                        .problems
+                        .push(format!("dizin yok: {}", p.dest.display()));
+                }
+                continue;
+            }
+            EntryKind::Symlink { target } => {
+                let check = |c: &Path| fs::read_link(c).is_ok_and(|t| t == Path::new(target));
+                let state = FileState::Symlink {
+                    target: PathBuf::from(target),
+                };
+                match found_at(&p.dest, applied, check) {
+                    Some(path) => Ok(FileRecord { path, state }),
+                    None => Err(format!(
+                        "symlink beklendiği gibi değil: {}",
+                        p.dest.display()
+                    )),
                 }
             }
-            EntryKind::Symlink { target } => match fs::read_link(&p.dest) {
-                Ok(t) if t == Path::new(target) => None,
-                _ if kept_both_matches(&p.dest, applied, |c| {
-                    fs::read_link(c).is_ok_and(|t| t == Path::new(target))
-                }) =>
-                {
-                    None
-                }
-                _ => Some(format!(
-                    "symlink beklendiği gibi değil: {}",
-                    p.dest.display()
-                )),
-            },
             EntryKind::File => {
                 let Some(want) = p.expected_hash else {
                     continue;
                 };
-                let matches = |c: &Path| hash_file(c).is_ok_and(|h| h == want);
-                if matches(&p.dest) || kept_both_matches(&p.dest, applied, matches) {
-                    None
-                } else {
-                    Some(format!(
+                let check = |c: &Path| hash_file(c).is_ok_and(|h| h == want);
+                match found_at(&p.dest, applied, check) {
+                    Some(path) => Ok(FileRecord {
+                        path,
+                        state: FileState::File { hash: want },
+                    }),
+                    None => Err(format!(
                         "içerik beklenen hash ile eşleşmiyor: {}",
                         p.dest.display()
-                    ))
+                    )),
                 }
             }
         };
-        if p.kind == EntryKind::Dir {
-            if let Some(problem) = problem {
-                report.problems.push(problem);
-            }
-            continue;
-        }
         report.expected += 1;
-        match problem {
-            None => report.verified += 1,
-            Some(problem) => report.problems.push(problem),
+        match found {
+            Ok(record) => {
+                report.verified += 1;
+                report.files.push(record);
+            }
+            Err(problem) => report.problems.push(problem),
         }
     }
     for (dest, value) in &plan.json_writes {
         report.expected += 1;
         let want = json_bytes(value);
         match fs::read(dest) {
-            Ok(have) if have == want => report.verified += 1,
+            Ok(have) if have == want => {
+                report.verified += 1;
+                report.files.push(FileRecord {
+                    path: dest.clone(),
+                    state: FileState::File {
+                        hash: hash_bytes(&want),
+                    },
+                });
+            }
             _ => report
                 .problems
                 .push(format!("JSON beklendiği gibi değil: {}", dest.display())),
         }
     }
+}
+
+/// `dest`, or a `KeepBoth` copy written beside it, that satisfies `check`.
+fn found_at(dest: &Path, applied: &ApplyReport, check: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    if check(dest) {
+        return Some(dest.to_path_buf());
+    }
+    applied
+        .kept_both
+        .iter()
+        .filter(|c| c.parent() == dest.parent())
+        .find(|c| check(c))
+        .cloned()
 }
 
 /// BLAKE3 of `bytes`.
@@ -132,15 +193,6 @@ pub fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
     bytes.push(b'\n');
     bytes
-}
-
-/// Whether a `KeepBoth` copy written beside `dest` satisfies `check`.
-fn kept_both_matches(dest: &Path, applied: &ApplyReport, check: impl Fn(&Path) -> bool) -> bool {
-    applied
-        .kept_both
-        .iter()
-        .filter(|c| c.parent() == dest.parent())
-        .any(|c| check(c))
 }
 
 /// Writes `report` to `<vt_home>/reports/<session>.json` (dirs 0700, file

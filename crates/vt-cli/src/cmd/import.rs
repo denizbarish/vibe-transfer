@@ -10,16 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use vt_claude::{
-    ClaudePlan, PlanInput, PlanQuestions, build_claude_apply_plan, read_claude_json_stable,
-};
-use vt_core::VtEnv;
-use vt_core::apply::{self, ApplyPlan, ApplyReport, ConflictResolver, Decision, Resolution};
+use vt_claude::{ClaudePlan, PlanInput, build_claude_apply_plan, read_claude_json_stable};
+use vt_core::apply::{self, ApplyPlan, ApplyReport, Decision, Resolution};
 use vt_core::bundle::{ReadBundle, SecretString, encrypt_to_file, read_bundle};
-use vt_core::fsutil::{create_private_dir_all, same_object};
-use vt_core::manifest::{JsonConflict, ProjectId, ProjectRef};
+use vt_core::fsutil::create_private_dir_all;
+use vt_core::manifest::ProjectId;
 use vt_core::pathmap::{Mapping, build_target_index, map_project};
-use vt_core::pending::PendingStore;
 use vt_core::report::{
     TransformRecord, VerifyReport, hash_bytes, json_bytes, verify_plan, write_report,
 };
@@ -27,7 +23,7 @@ use vt_core::secret_types::{SecretBytes, SecretItem, SecretKind};
 use vt_core::session::new_session_id;
 use vt_secrets::claude_service_name;
 
-use super::Ctx;
+use super::{Ctx, Precomputed, Questions, Staging, needs_confirmation, pending_store};
 use crate::ImportArgs;
 use crate::ui::{self, Prompter};
 
@@ -42,15 +38,6 @@ const CLEANUP_MARGIN_DAYS: u64 = 30;
 const LOGIN_KEY: &str = "claudeAiOauth";
 const KEPT_SECRET_KEY: &str = "hedefteki farklı değer korundu (giriş dışı sır anahtarı)";
 const KEPT_ACCOUNT: &str = "hedef hesabı korundu; giriş token'ı aktarılmadı";
-
-/// Removes the session staging folder however the import ends.
-struct Staging(PathBuf);
-
-impl Drop for Staging {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 #[derive(Serialize)]
 struct Mapped {
@@ -129,7 +116,7 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<()> {
             prompter.take_source_account(&target, s.meta.account_uuid.as_deref())?
         }
     };
-    ui::wait_until_closed("Claude", &|| ctx.claude_pids())?;
+    ui::wait_until_closed("Claude", "Aktarımdan önce", &|| ctx.claude_pids())?;
 
     let work_dir = staging.join("xform");
     create_private_dir_all(&work_dir)?;
@@ -332,17 +319,6 @@ fn map_projects(
     Ok(out)
 }
 
-/// Whether an automatic mapping to `root` must be confirmed by the user:
-/// `root` is the target home or `/`, an ancestor of home, inside the
-/// Claude dir, or a folder whose `.claude` is the Claude dir. Compared by
-/// file identity, so case variants, firmlinks and symlinks count too.
-fn needs_confirmation(root: &Path, env: &VtEnv) -> bool {
-    same_object(root, Path::new("/"))
-        || env.home.ancestors().any(|a| same_object(root, a))
-        || root.ancestors().any(|a| same_object(a, &env.claude_dir))
-        || same_object(&root.join(".claude"), &env.claude_dir)
-}
-
 fn read_target_json(path: &Path) -> Result<Value> {
     if fs::symlink_metadata(path).is_err() {
         return Ok(Value::Null);
@@ -363,39 +339,6 @@ fn target_has_claude_data(ctx: &Ctx) -> bool {
     dir_used || fs::symlink_metadata(&ctx.env.claude_json).is_ok()
 }
 
-/// The plan's answers, given to `apply`. A dest that changed after the
-/// plan was built keeps both versions: nothing is lost and nothing guessed.
-struct Precomputed<'a>(&'a BTreeMap<PathBuf, Resolution>);
-
-impl ConflictResolver for Precomputed<'_> {
-    fn file(&mut self, dest: &Path) -> Resolution {
-        self.0.get(dest).copied().unwrap_or(Resolution::KeepBoth)
-    }
-    fn json(&mut self, _c: &JsonConflict) -> Resolution {
-        Resolution::KeepTarget
-    }
-}
-
-struct Questions<'a, 'b>(&'a mut Prompter<'b>);
-
-impl PlanQuestions for Questions<'_, '_> {
-    fn project_decision(&mut self, project: &ProjectRef, root: &Path) -> Result<Decision> {
-        self.0.project_decision(project, root)
-    }
-    fn file(&mut self, dest: &Path) -> Result<Resolution> {
-        self.0.file(dest)
-    }
-    fn json(&mut self, c: &JsonConflict) -> Result<Resolution> {
-        self.0.json(c)
-    }
-}
-
-fn pending_store(vt_home: &Path) -> PendingStore {
-    PendingStore {
-        dir: vt_home.join("pending"),
-    }
-}
-
 struct PendingIds {
     all: Vec<ProjectId>,
     /// Projects that had no pending data before this import.
@@ -414,7 +357,12 @@ fn put_pending(vt_home: &Path, plan: &ClaudePlan) -> Result<PendingIds> {
     if plan.pending.is_empty() {
         return Ok(ids);
     }
-    let existing: BTreeSet<ProjectId> = store.list()?.into_iter().map(|p| p.project.id).collect();
+    let existing: BTreeSet<ProjectId> = store
+        .list()?
+        .items
+        .into_iter()
+        .map(|p| p.project.id)
+        .collect();
     for (project, items) in &plan.pending {
         if let Err(e) = store.put(project, items) {
             for id in &ids.created {
@@ -560,7 +508,9 @@ fn non_login_extras(target: Option<&SecretBytes>, source: &SecretBytes) -> Extra
     out
 }
 
-fn backup_secret(
+/// Saves `value` age-encrypted with `pass` to
+/// `<vt_home>/backups/<session>/secrets.age` (a new file).
+pub(super) fn backup_secret(
     vt_home: &Path,
     session: &str,
     pass: &SecretString,

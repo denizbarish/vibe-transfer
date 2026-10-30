@@ -591,7 +591,8 @@ pub(crate) fn unique_path(path: &Path) -> Result<PathBuf> {
     bail!("boş ad bulunamadı: {}", path.display())
 }
 
-pub(crate) fn validate_session(id: &str) -> Result<()> {
+/// Rejects a session id that is not a plain file name.
+pub fn validate_session(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && !id.starts_with('.')
         && id

@@ -24,6 +24,16 @@ enum Command {
     Export(ExportArgs),
     /// Bir paket dosyasını bu makineye uygular.
     Import(ImportArgs),
+    /// Hedef yolu bulunamayan projelerin bekleyen verilerini listeler.
+    Pending(PendingArgs),
+    /// Bekleyen bir projeyi bu makinedeki klasörüne yerleştirir.
+    Link(LinkArgs),
+    /// Bir oturumda yerleştirilen dosyaları yeniden denetler.
+    Verify(VerifyArgs),
+    /// Bir oturumu geri alır.
+    Rollback(RollbackArgs),
+    /// Kaynak makinede taşınan Claude girişini yedekleyip kaldırır.
+    LogoutSource(LogoutSourceArgs),
 }
 
 #[derive(Args)]
@@ -77,6 +87,63 @@ pub struct ImportArgs {
     pub json: bool,
 }
 
+#[derive(Args)]
+pub struct PendingArgs {
+    /// Hiçbir kaydın sahiplenmediği dosyaları listeler; onayla siler.
+    #[arg(long)]
+    pub orphans: bool,
+    /// Sonucu JSON olarak yazar.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+#[command(group = clap::ArgGroup::new("hedef").required(true).args(["project", "auto"]))]
+pub struct LinkArgs {
+    /// Proje kimliği, uzak depo adresi ya da kaynaktaki eski yol.
+    #[arg(value_name = "proje", requires = "path")]
+    pub project: Option<String>,
+    /// Projenin bu makinedeki klasörü.
+    #[arg(value_name = "yol")]
+    pub path: Option<PathBuf>,
+    /// Hedefte bulunan tüm bekleyen projeleri bağlar.
+    #[arg(long, conflicts_with_all = ["project", "path"])]
+    pub auto: bool,
+    /// --auto ile projelerin aranacağı klasörler (varsayılan: ev dizini).
+    #[arg(long, value_name = "yol,..", value_delimiter = ',', requires = "auto")]
+    pub roots: Vec<PathBuf>,
+    /// Özeti JSON olarak yazar.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct VerifyArgs {
+    /// Oturum kimliği (varsayılan: son rapor).
+    #[arg(value_name = "oturum")]
+    pub session: Option<String>,
+    /// Sonucu JSON olarak yazar.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct RollbackArgs {
+    /// Oturum kimliği (varsayılan: son oturum).
+    #[arg(value_name = "oturum")]
+    pub session: Option<String>,
+}
+
+#[derive(Args)]
+pub struct LogoutSourceArgs {
+    /// Dışa aktarma oturumunun kimliği (import çıktısında yazar).
+    #[arg(long, value_name = "oturum")]
+    pub session: String,
+    /// Yedek parolasını standart girdiden okur.
+    #[arg(long)]
+    pub passphrase_stdin: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = cmd::Ctx::from_process().and_then(|ctx| {
@@ -84,6 +151,11 @@ fn main() -> ExitCode {
             Command::Scan(args) => cmd::scan::run(&ctx, args),
             Command::Export(args) => cmd::export::run(&ctx, args),
             Command::Import(args) => cmd::import::run(&ctx, args),
+            Command::Pending(args) => cmd::pending::run(&ctx, args),
+            Command::Link(args) => cmd::link::run(&ctx, args),
+            Command::Verify(args) => cmd::verify::run(&ctx, args),
+            Command::Rollback(args) => cmd::rollback::run(&ctx, args),
+            Command::LogoutSource(args) => cmd::logout_source::run(&ctx, args),
         };
         let dumped = ctx.dump_test_secrets();
         result.and(dumped)

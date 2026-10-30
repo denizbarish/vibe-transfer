@@ -16,8 +16,8 @@ pub use inventory::{Inventory, classify, item_key};
 pub use merge::{merge_claude_json, merge_json_settings, merge_memory_md};
 pub use plan::{
     ClaudePlan, KIND_CLAUDE_JSON_MERGE, KIND_HOME_PATHS, KIND_JSON_MERGE, KIND_JSON_PATHS,
-    KIND_MEMORY_MERGE, KIND_SYMLINK_TARGET, PlanInput, PlanQuestions, SessionStats,
-    build_claude_apply_plan, resolve_dest_template,
+    KIND_MEMORY_MERGE, KIND_SYMLINK_TARGET, LinkInput, PlanInput, PlanQuestions, SessionStats,
+    build_claude_apply_plan, build_link_plan, resolve_dest_template,
 };
 pub use projects::project_inner_files;
 pub use transform::{

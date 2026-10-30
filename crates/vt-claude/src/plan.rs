@@ -19,18 +19,18 @@ use vt_core::apply::{ApplyPlan, Decision, Placement, ReplaceScope, Resolution};
 use vt_core::bundle::ReadBundle;
 use vt_core::fsutil::{create_private_file, same_object};
 use vt_core::manifest::{
-    Class, Entry, EntryKind, JsonConflict, ProjectId, ProjectRef, RootKind, Tool,
+    Class, Entry, EntryKind, JsonConflict, ProjectId, ProjectRef, RootKind, Selection, Tool,
 };
 use vt_core::pathcodec::claude_slug;
 use vt_core::pathmap::{Mapping, rewrite_home};
-use vt_core::pending::{DestTemplate, PendingItem};
+use vt_core::pending::{DestTemplate, PendingItem, PendingProject};
 use vt_core::report::{TransformRecord, hash_bytes, json_bytes};
 use vt_core::scan::hash_file;
 
 use crate::claude_json::read_claude_json_stable;
 use crate::inventory::classify_folded;
 use crate::merge::{merge_claude_json, merge_json_settings, merge_memory_md};
-use crate::projects::{first_cwds, is_project_entry_shape};
+use crate::projects::{first_cwds, fold, is_project_entry_shape};
 use crate::transform::{memory_slug_for, rewrite_json_paths, rewrite_path_value, target_slug_dir};
 
 /// Text files larger than this are placed unchanged.
@@ -49,6 +49,11 @@ pub const KIND_MEMORY_MERGE: &str = "memory_merge";
 pub const KIND_JSON_MERGE: &str = "json_merge";
 pub const KIND_CLAUDE_JSON_MERGE: &str = "claude_json_merge";
 pub const KIND_SYMLINK_TARGET: &str = "symlink_target";
+
+/// `source_host` of a link plan: names the side-by-side copies
+/// (`.from-pending`) of files that waited in the pending store.
+const LINK_SOURCE_HOST: &str = "pending";
+const REPO_PATHS_KEY: &str = "githubRepoPaths";
 
 const KEPT_TARGET: &str = "hedef sürümü korundu (kullanıcı seçimi)";
 const KEPT_TARGET_KEY: &str = "hedef değeri korundu (kullanıcı seçimi)";
@@ -136,6 +141,13 @@ pub fn build_claude_apply_plan(
     let m = &rb.manifest;
     for e in &m.entries {
         check_rel(e)?;
+        if e.root == RootKind::ClaudeDir && names_claude_json(&e.rel, env) {
+            bail!(
+                "paket, Claude klasöründe hedefin ~/.claude.json dosyasına denk gelen bir yol içeriyor: {:?}; \
+                 bu dosya yalnız birleştirilerek yazılır, içe aktarma reddedildi",
+                e.rel
+            );
+        }
         // Secrets and machine state never go into the Claude dir. The folded
         // classifier also catches spellings a case-insensitive file system
         // would open as the real name (`.Credentials.json`, `seßions`).
@@ -170,7 +182,8 @@ pub fn build_claude_apply_plan(
         .context("hedef ev dizini UTF-8 değil")?
         .to_owned();
     let mut b = Builder {
-        rb,
+        blobs: Blobs::Dir(&rb.blobs),
+        selection: &m.selection,
         env,
         input,
         src_home: m.source.home.clone(),
@@ -259,19 +272,179 @@ pub fn resolve_dest_template(
     check_root(project_root)?;
     match t {
         DestTemplate::ProjectRel(rel) => safe_join(project_root, rel, false).map(Some),
-        DestTemplate::ClaudeProjectSlugDir { rel_in_slug } => {
-            let dir = env
-                .claude_dir
-                .join("projects")
-                .join(memory_slug_for(project_root));
+        DestTemplate::ClaudeProjectSlugDir {
+            rel_in_slug,
+            subpath,
+        } => {
+            let dir = slug_dir_for(env, project_root, subpath.as_deref())?;
             safe_join(&dir, rel_in_slug, false).map(Some)
         }
-        DestTemplate::ClaudeJsonProjectsKey => Ok(None),
+        DestTemplate::ClaudeJsonProjectsKey | DestTemplate::ClaudeJsonRepoPaths => Ok(None),
     }
 }
 
+/// `<claude dir>/projects/<slug>` for a project at `root`: the slug of the
+/// root, or of `<root>/<subpath>` for sessions started in a subfolder.
+fn slug_dir_for(env: &VtEnv, root: &Path, subpath: Option<&str>) -> Result<PathBuf> {
+    let slug = match subpath.filter(|s| !s.is_empty()) {
+        None => memory_slug_for(root),
+        Some(sub) => claude_slug(&safe_join(root, sub, true)?.to_string_lossy()),
+    };
+    Ok(env.claude_dir.join("projects").join(slug))
+}
+
+/// What `link` already decided for one pending project.
+pub struct LinkInput<'a> {
+    pub project: &'a PendingProject,
+    /// The project's root on this machine.
+    pub root: &'a Path,
+    pub session_id: &'a str,
+    /// Owner-only directory for transformed blobs.
+    pub work_dir: &'a Path,
+}
+
+/// The apply plan that places the pending data of one project below its
+/// new root, under the import's rules: project files get the project's
+/// merge or replace question, session folders and `~/.claude.json` keys
+/// are merged. Every item is checked again as the import checked the
+/// bundle: a project file must have a Claude file shape, a slug file must
+/// stay in its folder and never be machine state.
+pub fn build_link_plan(
+    env: &VtEnv,
+    input: &LinkInput,
+    q: &mut dyn PlanQuestions,
+) -> Result<ClaudePlan> {
+    check_root(input.root)?;
+    let project = &input.project.project;
+    let mut mappings = BTreeMap::new();
+    mappings.insert(project.id.clone(), Mapping::Auto(input.root.to_path_buf()));
+    let plan_input = PlanInput {
+        mappings: &mappings,
+        decision: Decision::Merge,
+        take_oauth: false,
+        session_id: input.session_id,
+        work_dir: input.work_dir,
+    };
+    let selection = Selection::default();
+    let mut blobs = BTreeMap::new();
+    let mut entries = Vec::with_capacity(input.project.items.len());
+    for (i, item) in input.project.items.iter().enumerate() {
+        let mut e = item.entry.clone();
+        e.index = u32::try_from(i).context("too many pending items")?;
+        blobs.insert(e.index, item.blob.clone());
+        entries.push((e, item));
+    }
+    let dst_home = env
+        .home
+        .to_str()
+        .context("hedef ev dizini UTF-8 değil")?
+        .to_owned();
+    let mut b = Builder {
+        blobs: Blobs::Items(blobs),
+        selection: &selection,
+        env,
+        input: &plan_input,
+        src_home: String::new(),
+        dst_home,
+        mapped: BTreeMap::from([(project.old_path.clone(), input.root.to_path_buf())]),
+        projects: BTreeMap::from([(project.id.clone(), project)]),
+        out: ClaudePlan {
+            plan: ApplyPlan {
+                session_id: input.session_id.to_owned(),
+                source_host: LINK_SOURCE_HOST.to_owned(),
+                placements: Vec::new(),
+                replace_scopes: Vec::new(),
+                json_writes: Vec::new(),
+            },
+            pending: Vec::new(),
+            resolutions: BTreeMap::new(),
+            transformed: Vec::new(),
+            skipped: Vec::new(),
+            problems: Vec::new(),
+            sessions: SessionStats::default(),
+        },
+        pending: BTreeMap::new(),
+        project_decisions: BTreeMap::new(),
+        claude_scopes: BTreeSet::new(),
+        project_scopes: BTreeMap::new(),
+        session_dests: BTreeSet::new(),
+        blob_seq: 0,
+    };
+    let mut json_src = Map::new();
+    for (e, item) in &entries {
+        b.src_home = item.source_home.clone().unwrap_or_default();
+        if e.tool != Tool::Claude {
+            bail!("bekleyen kayıt Claude verisi değil: {:?}", e.rel);
+        }
+        match &item.dest_template {
+            DestTemplate::ProjectRel(rel) => {
+                if e.root != RootKind::Project(project.id.clone()) {
+                    bail!("bekleyen kayıt bu projeye ait değil: {:?}", e.rel);
+                }
+                let mut e = e.clone();
+                e.rel = rel.clone();
+                check_rel(&e)?;
+                if !is_project_entry_shape(rel, &e.kind) {
+                    bail!(
+                        "bekleyen kayıt Claude dosyası olmayan bir proje yolu içeriyor: {rel:?}; bağlama reddedildi"
+                    );
+                }
+                b.project_entry(&project.id, &e, q)?;
+            }
+            DestTemplate::ClaudeProjectSlugDir {
+                rel_in_slug,
+                subpath,
+            } => {
+                let never = classify_folded(&format!("projects/x/{rel_in_slug}"))
+                    .is_some_and(|(class, _)| class == Class::Never);
+                if e.root != RootKind::ClaudeDir || never {
+                    bail!("bekleyen kayıt geçersiz: {rel_in_slug:?}; bağlama reddedildi");
+                }
+                let base = slug_dir_for(env, input.root, subpath.as_deref())?;
+                safe_join(&base, rel_in_slug, true)?;
+                b.slug_entry(&base, e, rel_in_slug, q)?;
+            }
+            DestTemplate::ClaudeJsonProjectsKey => {
+                b.pending_json_part(e, "projects", &project.old_path, &mut json_src, q)?;
+            }
+            DestTemplate::ClaudeJsonRepoPaths => {
+                b.pending_json_part(e, REPO_PATHS_KEY, &project.old_path, &mut json_src, q)?;
+            }
+        }
+    }
+    if !json_src.is_empty() {
+        let src = Value::Object(json_src);
+        let before = hash_bytes(&json_bytes(&src));
+        b.merge_claude_json_doc(src, before, q)?;
+    }
+    b.finish()
+}
+
+/// Whether `rel` (in the Claude dir) names the target `~/.claude.json`, as
+/// it does with `CLAUDE_CONFIG_DIR`: compared as a case-insensitive file
+/// system would, and by file identity.
+fn names_claude_json(rel: &str, env: &VtEnv) -> bool {
+    let folded = |s: &str| s.split('/').map(fold).collect::<Vec<_>>().join("/");
+    let by_name = env
+        .claude_json
+        .strip_prefix(&env.claude_dir)
+        .ok()
+        .and_then(Path::to_str)
+        .is_some_and(|json_rel| folded(json_rel) == folded(rel));
+    by_name || same_object(&env.claude_dir.join(rel), &env.claude_json)
+}
+
+/// Where the content of an entry is.
+enum Blobs<'a> {
+    /// A bundle's blob folder: `<dir>/<entry index>`.
+    Dir(&'a Path),
+    /// Per entry index (a link plan's pending items).
+    Items(BTreeMap<u32, PathBuf>),
+}
+
 struct Builder<'a> {
-    rb: &'a ReadBundle,
+    blobs: Blobs<'a>,
+    selection: &'a Selection,
     env: &'a VtEnv,
     input: &'a PlanInput<'a>,
     src_home: String,
@@ -297,7 +470,11 @@ impl Builder<'_> {
     }
 
     fn blob(&self, e: &Entry) -> PathBuf {
-        self.rb.blobs.join(e.index.to_string())
+        match &self.blobs {
+            Blobs::Dir(dir) => dir.join(e.index.to_string()),
+            // An unknown index gives an empty path, which fails to open.
+            Blobs::Items(items) => items.get(&e.index).cloned().unwrap_or_default(),
+        }
     }
 
     fn mapping(&self, id: &ProjectId) -> Option<&PathBuf> {
@@ -399,6 +576,7 @@ impl Builder<'_> {
                 entry: e.clone(),
                 blob,
                 dest_template: template,
+                source_home: Some(self.src_home.clone()),
             });
         Ok(())
     }
@@ -421,10 +599,17 @@ impl Builder<'_> {
         }
         let target = match self.slug_target(slug, &cwds) {
             SlugTarget::Pending(id) => {
+                // Sessions started in a subfolder keep it, so the link
+                // finds the slug of the same subfolder below the new root.
+                let subpath = cwds.first().and_then(|cwd| {
+                    let old = &self.projects.get(&id)?.old_path;
+                    subpath_below(cwd, old)
+                });
                 for (e, rest) in entries {
                     if !rest.is_empty() {
                         let template = DestTemplate::ClaudeProjectSlugDir {
                             rel_in_slug: (*rest).to_owned(),
+                            subpath: subpath.clone(),
                         };
                         self.pend(&id, e, template)?;
                     }
@@ -444,25 +629,37 @@ impl Builder<'_> {
             self.claude_scopes.insert(base.clone());
         }
         for (e, rest) in entries {
-            let rule = if rest.ends_with(".jsonl") {
-                Rule::Session
-            } else if *rest == "memory/MEMORY.md" {
-                Rule::Memory
-            } else {
-                Rule::Plain
-            };
-            self.entry(&Owner::Claude, &base, e, rest, rule, q)?;
-            if e.kind == EntryKind::File && rule == Rule::Session && !rest.contains('/') {
-                let dest = base.join(rest);
-                if self.session_dests.insert(dest.clone()) {
-                    self.out.sessions.placed += 1;
-                    if fs::symlink_metadata(&dest).is_err() {
-                        self.out.sessions.new_files += 1;
-                    }
+            self.slug_entry(&base, e, rest, q)?;
+        }
+        Ok(())
+    }
+
+    /// One entry of a slug folder placed at `base` + `rest`.
+    fn slug_entry(
+        &mut self,
+        base: &Path,
+        e: &Entry,
+        rest: &str,
+        q: &mut dyn PlanQuestions,
+    ) -> Result<()> {
+        let rule = if rest.ends_with(".jsonl") {
+            Rule::Session
+        } else if rest == "memory/MEMORY.md" {
+            Rule::Memory
+        } else {
+            Rule::Plain
+        };
+        self.entry(&Owner::Claude, base, e, rest, rule, q)?;
+        if e.kind == EntryKind::File && rule == Rule::Session && !rest.contains('/') {
+            let dest = base.join(rest);
+            if self.session_dests.insert(dest.clone()) {
+                self.out.sessions.placed += 1;
+                if fs::symlink_metadata(&dest).is_err() {
+                    self.out.sessions.new_files += 1;
                 }
-                let oldest = &mut self.out.sessions.oldest_mtime_ns;
-                *oldest = Some(oldest.map_or(e.mtime_ns, |o| o.min(e.mtime_ns)));
             }
+            let oldest = &mut self.out.sessions.oldest_mtime_ns;
+            *oldest = Some(oldest.map_or(e.mtime_ns, |o| o.min(e.mtime_ns)));
         }
         Ok(())
     }
@@ -761,7 +958,19 @@ impl Builder<'_> {
         for c in &outcome.conflicts {
             self.collapsed_key(&mut src, c, q)?;
         }
+        let before = e.hash.unwrap_or(hash_bytes(&bytes));
+        self.merge_claude_json_doc(src, before, q)
+    }
 
+    /// Merges `src` (paths already rewritten) into the target
+    /// `~/.claude.json` under the plan's decision. `before` is the hash
+    /// recorded for the source side.
+    fn merge_claude_json_doc(
+        &mut self,
+        src: Value,
+        before: [u8; 32],
+        q: &mut dyn PlanQuestions,
+    ) -> Result<()> {
         let path = self.env.claude_json.clone();
         let original = match fs::symlink_metadata(&path) {
             Ok(_) => read_claude_json_stable(&path)?,
@@ -785,34 +994,70 @@ impl Builder<'_> {
         }
         if merged != original {
             let after = hash_bytes(&json_bytes(&merged));
-            let before = e.hash.unwrap_or(hash_bytes(&bytes));
             self.record(&path, before, after, KIND_CLAUDE_JSON_MERGE);
             self.out.plan.json_writes.push((path, merged));
         }
         Ok(())
     }
 
-    /// Moves `projects` entries of pending projects out of `src` into one
-    /// pending item per project: a blob holding `{ old key: value }`.
+    /// Moves `projects` entries and `githubRepoPaths` paths of pending
+    /// projects out of `src` into pending items per project: blobs holding
+    /// `{ old key: value }` and `{ repo: [old path, ..] }`. A repo whose
+    /// paths all moved is dropped from `src`.
     fn pend_claude_json_keys(&mut self, e: &Entry, src: &mut Value) -> Result<()> {
-        let Some(Value::Object(projects)) = src.get_mut("projects") else {
-            return Ok(());
+        let pending_owner = |b: &Self, path: &str| {
+            b.owner_of(path)
+                .filter(|p| b.mapping(&p.id).is_none())
+                .map(|p| p.id.clone())
         };
-        let mut per_project: BTreeMap<ProjectId, Map<String, Value>> = BTreeMap::new();
-        for key in projects.keys().cloned().collect::<Vec<_>>() {
-            let Some(owner) = self.owner_of(&key) else {
-                continue;
-            };
-            if self.mapping(&owner.id).is_some() {
-                continue;
-            }
-            let id = owner.id.clone();
-            if let Some(v) = projects.remove(&key) {
-                per_project.entry(id).or_default().insert(key, v);
+        let mut keys: BTreeMap<ProjectId, Map<String, Value>> = BTreeMap::new();
+        if let Some(Value::Object(projects)) = src.get_mut("projects") {
+            for key in projects.keys().cloned().collect::<Vec<_>>() {
+                if let Some(id) = pending_owner(self, &key)
+                    && let Some(v) = projects.remove(&key)
+                {
+                    keys.entry(id).or_default().insert(key, v);
+                }
             }
         }
-        for (id, keys) in per_project {
-            let bytes = serde_json::to_vec_pretty(&Value::Object(keys))?;
+        let mut repos: BTreeMap<ProjectId, Map<String, Value>> = BTreeMap::new();
+        if let Some(Value::Object(all)) = src.get_mut(REPO_PATHS_KEY) {
+            let mut emptied = Vec::new();
+            for (repo, paths) in all.iter_mut() {
+                let Value::Array(list) = paths else { continue };
+                let had = list.len();
+                list.retain(|p| {
+                    let Some(id) = p.as_str().and_then(|s| pending_owner(self, s)) else {
+                        return true;
+                    };
+                    let held = repos.entry(id).or_default();
+                    if let Value::Array(v) = held
+                        .entry(repo.clone())
+                        .or_insert_with(|| Value::Array(Vec::new()))
+                    {
+                        v.push(p.clone());
+                    }
+                    false
+                });
+                if had > 0 && list.is_empty() {
+                    emptied.push(repo.clone());
+                }
+            }
+            for repo in emptied {
+                all.remove(&repo);
+            }
+        }
+        let parts = keys
+            .into_iter()
+            .map(|(id, m)| (id, m, DestTemplate::ClaudeJsonProjectsKey))
+            .chain(
+                repos
+                    .into_iter()
+                    .map(|(id, m)| (id, m, DestTemplate::ClaudeJsonRepoPaths)),
+            )
+            .collect::<Vec<_>>();
+        for (id, part, template) in parts {
+            let bytes = serde_json::to_vec_pretty(&Value::Object(part))?;
             let (blob, hash) = self.stage(&bytes)?;
             let mut entry = e.clone();
             entry.size = bytes.len() as u64;
@@ -820,8 +1065,68 @@ impl Builder<'_> {
             self.pending.entry(id).or_default().push(PendingItem {
                 entry,
                 blob,
-                dest_template: DestTemplate::ClaudeJsonProjectsKey,
+                dest_template: template,
+                source_home: Some(self.src_home.clone()),
             });
+        }
+        Ok(())
+    }
+
+    /// One `~/.claude.json` part a link brings back: the stored object under
+    /// `key`, paths rewritten, added to `out`. Entries that are not the
+    /// project's (a stored key or path outside `old_path`) are skipped.
+    fn pending_json_part(
+        &mut self,
+        e: &Entry,
+        key: &str,
+        old_path: &str,
+        out: &mut Map<String, Value>,
+        q: &mut dyn PlanQuestions,
+    ) -> Result<()> {
+        if e.root != RootKind::ClaudeJson {
+            bail!("bekleyen kayıt geçersiz: ~/.claude.json parçası değil");
+        }
+        let bytes = fs::read(self.blob(e)).context("bekleyen ~/.claude.json parçası okunamadı")?;
+        let Ok(Value::Object(mut part)) = serde_json::from_slice::<Value>(&bytes) else {
+            bail!("bekleyen ~/.claude.json parçası geçerli bir JSON nesnesi değil");
+        };
+        let ours = |p: &str| is_below(p, old_path);
+        if key == REPO_PATHS_KEY {
+            for paths in part.values_mut() {
+                if let Value::Array(list) = paths {
+                    list.retain(|p| p.as_str().is_some_and(ours));
+                }
+            }
+        } else {
+            part.retain(|k, _| ours(k));
+        }
+        let mut doc = Value::Object(Map::from_iter([(key.to_owned(), Value::Object(part))]));
+        let outcome = rewrite_json_paths(&mut doc, &self.src_home, &self.dst_home, &self.mapped);
+        for c in &outcome.conflicts {
+            self.collapsed_key(&mut doc, c, q)?;
+        }
+        let Some(Value::Object(part)) = doc.get_mut(key).map(std::mem::take) else {
+            return Ok(());
+        };
+        let Value::Object(slot) = out
+            .entry(key.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()))
+        else {
+            return Ok(());
+        };
+        for (k, v) in part {
+            match (slot.get_mut(&k), v) {
+                (Some(Value::Array(have)), Value::Array(add)) => {
+                    for p in add {
+                        if !have.contains(&p) {
+                            have.push(p);
+                        }
+                    }
+                }
+                (_, v) => {
+                    slot.insert(k, v);
+                }
+            }
         }
         Ok(())
     }
@@ -853,7 +1158,7 @@ impl Builder<'_> {
             .map(|p| p.dest.clone())
             .chain(self.out.plan.json_writes.iter().map(|(d, _)| d.clone()))
             .collect();
-        let selection = &self.rb.manifest.selection;
+        let selection = self.selection;
         let claude_dir = self.env.claude_dir.clone();
         for dir in std::mem::take(&mut self.claude_scopes) {
             let mut keep = dests_below(&dests, &dir);
@@ -965,6 +1270,17 @@ fn set_claude_json_value(doc: &mut Value, c: &JsonConflict) {
 
 fn read_json_file(path: &Path) -> Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// `path` relative to `base` when strictly below it; `None` for `base`
+/// itself or a path outside.
+fn subpath_below(path: &str, base: &str) -> Option<String> {
+    if !is_below(path, base) {
+        return None;
+    }
+    let rest = path.get(base.trim_end_matches('/').len()..)?;
+    let rest = rest.trim_matches('/');
+    (!rest.is_empty()).then(|| rest.to_owned())
 }
 
 /// `path` is `base` or below it (string prefix at a `/` boundary).

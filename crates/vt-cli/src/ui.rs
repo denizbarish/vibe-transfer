@@ -200,6 +200,10 @@ pub struct Answers {
     pub json: Option<String>,
     /// Whether to write the suggested `cleanupPeriodDays`.
     pub cleanup: Option<bool>,
+    /// Whether to roll the session back.
+    pub rollback: Option<bool>,
+    /// Whether to remove the listed pending orphans.
+    pub orphans: Option<bool>,
     /// PIDs to treat as a running Claude (the real process list belongs to
     /// the real machine, not the synthetic home).
     #[serde(default)]
@@ -468,9 +472,45 @@ impl<'a> Prompter<'a> {
     }
 }
 
+impl Prompter<'_> {
+    /// Whether to undo `session`. Without a terminal (and no test answer)
+    /// this fails: no flag skips the question.
+    pub fn confirm_rollback(&mut self, session: &str) -> Result<bool> {
+        let question = format!(
+            "{} oturumu geri alınsın mı? Yerleştirilenler kaldırılır, yedekler geri konur.",
+            clean(session)
+        );
+        match self.answers {
+            Some(a) => a.rollback.ok_or_else(|| missing_answer("rollback")),
+            None if interactive() => Confirm::new()
+                .with_prompt(question)
+                .default(false)
+                .interact()
+                .context("onay alınamadı"),
+            None => Err(no_terminal(&question)),
+        }
+    }
+
+    /// Whether to remove `count` orphan files; `None` when nobody can be
+    /// asked (nothing is removed then).
+    pub fn confirm_orphans(&mut self, count: usize) -> Result<Option<bool>> {
+        match self.answers {
+            Some(a) => Ok(a.orphans),
+            None if interactive() => Confirm::new()
+                .with_prompt(format!("{count} sahipsiz dosya silinsin mi?"))
+                .default(false)
+                .interact()
+                .map(Some)
+                .context("onay alınamadı"),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Waits until `pids()` is empty: on a terminal the user closes the tool
-/// and confirms; without one the import stops.
-pub fn wait_until_closed(tool_name: &str, pids: &dyn Fn() -> Vec<u32>) -> Result<()> {
+/// and confirms; without one the command stops. `before` names the step,
+/// e.g. "Aktarımdan önce".
+pub fn wait_until_closed(tool_name: &str, before: &str, pids: &dyn Fn() -> Vec<u32>) -> Result<()> {
     loop {
         let running = pids();
         if running.is_empty() {
@@ -478,7 +518,7 @@ pub fn wait_until_closed(tool_name: &str, pids: &dyn Fn() -> Vec<u32>) -> Result
         }
         let list: Vec<String> = running.iter().map(u32::to_string).collect();
         let msg = format!(
-            "{tool_name} çalışıyor (PID {}). Aktarımdan önce kapatılmalı.",
+            "{tool_name} çalışıyor (PID {}). {before} kapatılmalı.",
             list.join(", ")
         );
         if !interactive() {

@@ -3,19 +3,30 @@
 
 pub mod export;
 pub mod import;
+pub mod link;
+pub mod logout_source;
+pub mod pending;
+pub mod rollback;
 pub mod scan;
+pub mod verify;
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use vt_claude::PlanQuestions;
 use vt_core::VtEnv;
-use vt_core::manifest::{Category, Selection, Tool};
+use vt_core::apply::{ConflictResolver, Decision, Resolution};
+use vt_core::fsutil::same_object;
+use vt_core::manifest::{Category, JsonConflict, ProjectRef, Selection, Tool};
+use vt_core::pending::PendingStore;
 use vt_core::secret_types::SecretBytes;
 use vt_secrets::{KeyringStore, MemStore, SecretStore};
 
-use crate::ui::{self, Answers};
+use crate::ui::{self, Answers, Prompter};
 
 /// Test hook: points the whole environment at this directory and swaps the
 /// OS secret store for an in-memory one.
@@ -214,6 +225,92 @@ pub fn resolve_selection(flags: &SelectionFlags) -> Result<Selection> {
         bail!("hiç kategori seçilmedi");
     }
     Ok(sel)
+}
+
+/// Removes a session staging folder however the command ends.
+pub struct Staging(pub PathBuf);
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Whether a project root must be confirmed by the user before data is
+/// placed there: `root` is the target home or `/`, an ancestor of home,
+/// inside the Claude dir, or a folder whose `.claude` is the Claude dir.
+/// Compared by file identity, so case variants, firmlinks and symlinks
+/// count too. Used by `import` and `link`.
+pub fn needs_confirmation(root: &Path, env: &VtEnv) -> bool {
+    same_object(root, Path::new("/"))
+        || env.home.ancestors().any(|a| same_object(root, a))
+        || root.ancestors().any(|a| same_object(a, &env.claude_dir))
+        || same_object(&root.join(".claude"), &env.claude_dir)
+}
+
+pub fn pending_store(vt_home: &Path) -> PendingStore {
+    PendingStore {
+        dir: vt_home.join("pending"),
+    }
+}
+
+/// The plan's answers, given to `apply`. A dest that changed after the
+/// plan was built keeps both versions: nothing is lost and nothing guessed.
+pub struct Precomputed<'a>(pub &'a BTreeMap<PathBuf, Resolution>);
+
+impl ConflictResolver for Precomputed<'_> {
+    fn file(&mut self, dest: &Path) -> Resolution {
+        self.0.get(dest).copied().unwrap_or(Resolution::KeepBoth)
+    }
+    fn json(&mut self, _c: &JsonConflict) -> Resolution {
+        Resolution::KeepTarget
+    }
+}
+
+/// The plan's questions, answered by the user (or the test answers).
+pub struct Questions<'a, 'b>(pub &'a mut Prompter<'b>);
+
+impl PlanQuestions for Questions<'_, '_> {
+    fn project_decision(&mut self, project: &ProjectRef, root: &Path) -> Result<Decision> {
+        self.0.project_decision(project, root)
+    }
+    fn file(&mut self, dest: &Path) -> Result<Resolution> {
+        self.0.file(dest)
+    }
+    fn json(&mut self, c: &JsonConflict) -> Result<Resolution> {
+        self.0.json(c)
+    }
+}
+
+/// Session ids that have a `<ext>` file in `<vt_home>/<dir>`, oldest first:
+/// by the time stamp in the id, then by when the file was created. Ids
+/// with a `-` suffix after the random part (e.g. `-ayar`) belong to
+/// another session and are left out.
+pub fn sessions_in(vt_home: &Path, dir: &str, ext: &str) -> Result<Vec<String>> {
+    let path = vt_home.join(dir);
+    let entries = match fs::read_dir(&path) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("okunamadı: {}", path.display())),
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(ext)) else {
+            continue;
+        };
+        if id.split('-').count() != 2 || vt_core::apply::validate_session(id).is_err() {
+            continue;
+        }
+        let born = entry
+            .metadata()
+            .and_then(|m| m.created().or_else(|_| m.modified()))
+            .ok();
+        let stamp = id.split('-').next().unwrap_or_default().to_owned();
+        found.push((stamp, born, id.to_owned()));
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, _, id)| id).collect())
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {
