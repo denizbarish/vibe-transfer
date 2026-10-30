@@ -1051,3 +1051,85 @@ fn cache_export_skips_never_name_variants_and_imports() {
     assert!(!fx.dst.join(".claude/Sessions").exists());
     assert!(!fx.dst.join(".claude/tasks/t/.LOCK").exists());
 }
+
+#[test]
+fn import_reports_a_cut_jsonl_tail_from_the_source() {
+    let fx = setup();
+    let session = fx.slug_dir(&fx.src, &fx.src_lost()).join("sess-lost.jsonl");
+    let mut torn = fs::read(&session).unwrap();
+    torn.extend_from_slice(b"{\"type\":\"user\",\"cwd\":\"/half");
+    fs::write(&session, &torn).unwrap();
+    let bundle = export(&fx);
+    let i = import(&fx, &bundle, None, None);
+    ok(&i);
+    let reason = "son satır tamamlanmamış, 27 bayt alınmadı";
+    let rep = report(&fx, &i);
+    let hit = |v: &Value| {
+        v.as_array().unwrap().iter().any(|item| {
+            let s = item.to_string();
+            s.contains("kaynak:") && s.contains("sess-lost.jsonl") && s.contains(reason)
+        })
+    };
+    assert!(hit(&rep["skipped"]), "{rep}");
+    assert!(hit(&i.summary["skipped"]), "{}", i.summary);
+}
+
+#[test]
+fn import_same_account_keeps_target_only_non_login_secret_entries() {
+    let fx = setup();
+    let secret = |tag: &str| format!("{}{tag}", "synthetic-");
+    let mut value: Value = serde_json::from_str(&fake_token("src")).unwrap();
+    value["mcpOAuth"] = json!({"shared": secret("src-shared"), "srconly": secret("src-only")});
+    write(
+        &fx.tmp.path().join("src-secrets.json"),
+        &json!([{"service": SERVICE, "account": "src", "value": value.to_string()}]).to_string(),
+    );
+    let bundle = export(&fx);
+    // Same account on the target: the login moves without a question.
+    write(
+        &fx.dst.join(".claude.json"),
+        &json!({"oauthAccount": {"accountUuid": "uuid-src"}}).to_string(),
+    );
+    let mut target: Value = serde_json::from_str(&fake_token("dst")).unwrap();
+    target["mcpOAuth"] = json!({"shared": secret("dst-shared"), "dstonly": secret("dst-only")});
+    target["pluginSecrets"] = json!({"plug": secret("plug")});
+    let i = import(
+        &fx,
+        &bundle,
+        Some(json!({"decision": "merge"})),
+        Some(json!([{"service": SERVICE, "account": "dst", "value": target.to_string()}])),
+    );
+    ok(&i);
+
+    let mut expected: Value = serde_json::from_str(&fake_token("src")).unwrap();
+    expected["mcpOAuth"] = json!({
+        "shared": secret("src-shared"),
+        "srconly": secret("src-only"),
+        "dstonly": secret("dst-only"),
+    });
+    expected["pluginSecrets"] = json!({"plug": secret("plug")});
+    assert_eq!(
+        secret_digest(&i, "dst"),
+        Some(digest(&expected.to_string()))
+    );
+    // The differing key is reported by name only.
+    let rep = report(&fx, &i);
+    assert!(
+        rep["skipped"]
+            .to_string()
+            .contains(&format!("keychain:{SERVICE}#mcpOAuth.shared")),
+        "{rep}"
+    );
+    no_leaks(
+        &fx,
+        &i,
+        &[
+            fake_token("src"),
+            fake_token("dst"),
+            secret("src-shared"),
+            secret("dst-shared"),
+            secret("dst-only"),
+            secret("plug"),
+        ],
+    );
+}

@@ -949,3 +949,47 @@ fn corrupt_secret_record_leaves_the_secret_step_pending() {
     assert_eq!(dst_digest(&secrets), Some(digest(&fake_token())));
     assert!(!fx.dst_app().join("CLAUDE.md").exists());
 }
+
+/// A Claude started while the questions were answered stops the import
+/// before anything on the target changes.
+#[test]
+fn import_checks_claude_again_right_before_applying() {
+    let fx = setup();
+    let (bundle, _) = export(&fx);
+    let before = snapshot(&fx.dst, &fx.dst.join(".vibe-transfer"));
+    let out = run(
+        &fx.dst,
+        "dst",
+        &[
+            "import",
+            bundle.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--json",
+        ],
+        &[],
+        Some(json!({"claude_pids": [4242], "claude_pids_after": 1})),
+        &format!("{PASS}\n"),
+    );
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    assert!(text(&out.stderr).contains("4242"), "{}", text(&out.stderr));
+    assert_eq!(snapshot(&fx.dst, &fx.dst.join(".vibe-transfer")), before);
+    assert!(pending_ids(&fx).is_empty());
+}
+
+#[test]
+fn link_checks_claude_again_right_before_applying() {
+    let fx = setup();
+    let (bundle, _) = export(&fx);
+    import(&fx, &bundle, None);
+    git_repo(&fx.dst_lost(), "git@github.com:acme/lost.git");
+    let before = snapshot(&fx.dst, &fx.dst.join(".vibe-transfer"));
+    let out = dst(
+        &fx,
+        &["link", "--auto", "--json"],
+        Some(json!({"claude_pids": [4242], "claude_pids_after": 1})),
+    );
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    assert!(text(&out.stderr).contains("4242"), "{}", text(&out.stderr));
+    assert_eq!(snapshot(&fx.dst, &fx.dst.join(".vibe-transfer")), before);
+    assert_eq!(pending_ids(&fx), vec![LOST_REMOTE.to_owned()]);
+}

@@ -81,7 +81,7 @@ pub fn run(ctx: &Ctx, args: &ExportArgs) -> Result<()> {
     })?;
     // Everything that can fail fast does so before any data is read.
     let given = if args.passphrase_stdin {
-        Some(ui::read_passphrase_stdin(true)?)
+        Some(ui::read_passphrase_stdin(true, ui::BUNDLE_PASS_LABEL)?)
     } else {
         ui::ensure_passphrase_display()?;
         None
@@ -154,13 +154,17 @@ pub fn run(ctx: &Ctx, args: &ExportArgs) -> Result<()> {
         }
         let outcome = match (&entry.root, &json_bytes) {
             (RootKind::ClaudeJson, Some(bytes)) => {
-                add_bytes(&mut writer, &mut entry, bytes, &bar).map(|()| None)
+                add_bytes(&mut writer, &mut entry, bytes, &bar).map(|()| Added::Whole)
             }
             _ => add_from_disk(&mut writer, &mut entry, &path, &bar),
         };
         match outcome? {
-            None => kept.push(entry),
-            Some(reason) => skipped.push((item_key(&entry.root, &entry.rel), reason)),
+            Added::Whole => kept.push(entry),
+            Added::TailCut(bytes) => {
+                skipped.push((item_key(&entry.root, &entry.rel), tail_cut_reason(bytes)));
+                kept.push(entry);
+            }
+            Added::Skipped(reason) => skipped.push((item_key(&entry.root, &entry.rel), reason)),
         }
     }
     for item in &secrets {
@@ -340,27 +344,45 @@ fn add_bytes(
     Ok(())
 }
 
+/// What happened to one file streamed into the bundle.
+enum Added {
+    /// Every byte was written.
+    Whole,
+    /// Written up to its last newline; this many trailing bytes were not.
+    TailCut(u64),
+    /// Not written, with the reason.
+    Skipped(String),
+}
+
+/// Skip reason for the unfinished last line of a cut `.jsonl` file.
+fn tail_cut_reason(bytes: u64) -> String {
+    format!("son satır tamamlanmamış, {bytes} bayt alınmadı")
+}
+
 /// Streams one file into the bundle. `.jsonl` files are cut after their
 /// last newline (a line still being written is dropped, `partial_tail`
-/// set). `size` and `hash` describe exactly the bytes written. Returns the
-/// skip reason when the file vanished or cannot be opened; a read error
-/// mid-file fails the export, since the writer cannot recover from it.
+/// set, the dropped byte count returned). `size` and `hash` describe
+/// exactly the bytes written. Returns the skip reason when the file
+/// vanished or cannot be opened; a read error mid-file fails the export,
+/// since the writer cannot recover from it.
 fn add_from_disk(
     writer: &mut BundleWriter,
     entry: &mut Entry,
     path: &Path,
     bar: &ProgressBar,
-) -> Result<Option<String>> {
+) -> Result<Added> {
     let mut file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(VANISHED.to_owned())),
-        Err(e) => return Ok(Some(format!("{UNREADABLE_DIR}: {e}"))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Added::Skipped(VANISHED.to_owned()));
+        }
+        Err(e) => return Ok(Added::Skipped(format!("{UNREADABLE_DIR}: {e}"))),
     };
     let md = file
         .metadata()
         .with_context(|| format!("metadata {}", path.display()))?;
     if !md.is_file() {
-        return Ok(Some(format!(
+        return Ok(Added::Skipped(format!(
             "{UNREADABLE_DIR}: tarama sırasında türü değişti"
         )));
     }
@@ -385,7 +407,11 @@ fn add_from_disk(
             .with_context(|| format!("pakete eklenemedi: {}", path.display()))?,
     );
     entry.size = reader.count;
-    Ok(None)
+    Ok(if limit < len {
+        Added::TailCut(len - limit)
+    } else {
+        Added::Whole
+    })
 }
 
 /// Offset just past the last `\n` in the first `len` bytes; 0 if none.

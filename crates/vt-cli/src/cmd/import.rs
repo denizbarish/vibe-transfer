@@ -39,6 +39,7 @@ const CLEANUP_MARGIN_DAYS: u64 = 30;
 const LOGIN_KEY: &str = "claudeAiOauth";
 const KEPT_SECRET_KEY: &str = "hedefteki farklı değer korundu (giriş dışı sır anahtarı)";
 const KEPT_ACCOUNT: &str = "hedef hesabı korundu; giriş token'ı aktarılmadı";
+const REPLACED_SECRET_KEY: &str = "hedefteki farklı değerin yerine kaynaktaki alındı, önceki değer yedekte (giriş dışı sır anahtarı)";
 
 #[derive(Serialize)]
 struct Mapped {
@@ -77,7 +78,7 @@ struct Summary {
 
 pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<()> {
     let pass = if args.passphrase_stdin {
-        ui::read_passphrase_stdin(false)?
+        ui::read_passphrase_stdin(false, ui::BUNDLE_PASS_LABEL)?
     } else {
         ui::prompt_passphrase()?
     };
@@ -129,6 +130,8 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<()> {
         work_dir: &work_dir,
     };
     let plan = build_claude_apply_plan(&rb, env, &input, &mut Questions(&mut prompter))?;
+    // The plan may have asked many questions: Claude can have started since.
+    ui::wait_until_closed("Claude", "Aktarımdan önce", &|| ctx.claude_pids())?;
 
     let sessions_before = count_sessions(&env.claude_dir);
     let pending_ids = put_pending(&env.vt_home, &plan)?;
@@ -409,7 +412,33 @@ fn import_secret(
     let key = format!("keychain:{service}");
     let previous = ctx.store.get(&service, &account)?;
     let new_value = if take_oauth {
-        item.value.clone()
+        // The source login plus what only the target holds (e.g. MCP
+        // OAuth entries of servers the source never used).
+        match previous.as_ref() {
+            None => item.value.clone(),
+            Some(prev) => {
+                let extras = non_login_extras(Some(&item.value), prev);
+                for k in &extras.kept {
+                    report
+                        .skipped
+                        .push((format!("{key}#{k}"), REPLACED_SECRET_KEY.to_owned()));
+                }
+                if let Some(bad) = extras.unusable {
+                    let side = match bad {
+                        Bad::Base => "kaynak",
+                        Bad::Extra => "hedef",
+                    };
+                    report.skipped.push((
+                        key.clone(),
+                        format!(
+                            "{side} sır değeri JSON nesnesi değil; hedefteki giriş dışı \
+                             kısımlar korunamadı, önceki değer yedekte"
+                        ),
+                    ));
+                }
+                extras.value.unwrap_or_else(|| item.value.clone())
+            }
+        }
     } else {
         report.skipped.push((key.clone(), KEPT_ACCOUNT.to_owned()));
         let extras = non_login_extras(previous.as_ref(), &item.value);
@@ -418,8 +447,15 @@ fn import_secret(
                 .skipped
                 .push((format!("{key}#{k}"), KEPT_SECRET_KEY.to_owned()));
         }
-        if let Some(reason) = extras.unusable {
-            report.skipped.push((key.clone(), reason.to_owned()));
+        if let Some(bad) = extras.unusable {
+            let side = match bad {
+                Bad::Base => "hedef",
+                Bad::Extra => "kaynak",
+            };
+            report.skipped.push((
+                key.clone(),
+                format!("{side} sır değeri JSON nesnesi değil; giriş dışı kısımlar aktarılmadı"),
+            ));
         }
         match extras.value {
             Some(merged) => merged,
@@ -460,36 +496,42 @@ fn import_secret(
     Ok(take_oauth)
 }
 
-/// What the target keeps when it keeps its own login.
+/// One value merged with the non-login parts of another.
 struct Extras {
-    /// The new target value; `None` when nothing changes.
+    /// The merged value; `None` when nothing changes.
     value: Option<SecretBytes>,
-    /// Keys (never values) where the target's differing value was kept.
+    /// Keys (never values) where the base's differing value was kept.
     kept: Vec<String>,
-    /// Why the non-login parts could not be merged, if so.
-    unusable: Option<&'static str>,
+    /// Which side is not a JSON object, so nothing could be merged.
+    unusable: Option<Bad>,
 }
 
-/// The target value (or, with none, an empty object) plus the source's
-/// non-login parts it lacks, e.g. MCP OAuth entries. Same-name keys with a
-/// different value keep the target's and are listed in `kept`.
-fn non_login_extras(target: Option<&SecretBytes>, source: &SecretBytes) -> Extras {
+/// The `non_login_extras` argument that is not a JSON object.
+enum Bad {
+    Base,
+    Extra,
+}
+
+/// The base value (or, with none, an empty object) plus the non-login
+/// parts of `extra` it lacks, e.g. MCP OAuth entries. Same-name keys with a
+/// different value keep the base's and are listed in `kept`. Keeping its
+/// own login, the target is the base and the source the extra; taking the
+/// source login, the sides swap.
+fn non_login_extras(base: Option<&SecretBytes>, extra: &SecretBytes) -> Extras {
     let mut out = Extras {
         value: None,
         kept: Vec::new(),
         unusable: None,
     };
-    let Ok(Value::Object(sm)) = serde_json::from_slice::<Value>(source.expose()) else {
-        out.unusable =
-            Some("kaynak sır değeri JSON nesnesi değil; giriş dışı kısımlar aktarılmadı");
+    let Ok(Value::Object(sm)) = serde_json::from_slice::<Value>(extra.expose()) else {
+        out.unusable = Some(Bad::Extra);
         return out;
     };
-    let mut tm = match target.map(|t| serde_json::from_slice::<Value>(t.expose())) {
+    let mut tm = match base.map(|t| serde_json::from_slice::<Value>(t.expose())) {
         None => Map::new(),
         Some(Ok(Value::Object(m))) => m,
         Some(_) => {
-            out.unusable =
-                Some("hedef sır değeri JSON nesnesi değil; giriş dışı kısımlar aktarılmadı");
+            out.unusable = Some(Bad::Base);
             return out;
         }
     };

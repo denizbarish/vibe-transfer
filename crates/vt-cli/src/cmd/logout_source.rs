@@ -153,11 +153,26 @@ fn current_account_uuid(path: &std::path::Path) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
+/// Prompt label of the backup passphrase: this one is new, not the
+/// bundle's.
+const BACKUP_PASS_LABEL: &str = "Yedek parolası";
+
 /// The backup passphrase: typed twice on a terminal, or one line of stdin
 /// with `--passphrase-stdin`.
 fn read_passphrase(args: &LogoutSourceArgs) -> Result<SecretString> {
     if !args.passphrase_stdin && !ui::interactive() {
         bail!("yedek parolası için terminal yok; parolayı --passphrase-stdin ile verin");
     }
-    ui::read_passphrase_stdin(true)
+    ui::read_passphrase_stdin(true, BACKUP_PASS_LABEL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_prompt_is_not_the_bundle_passphrase() {
+        assert_ne!(BACKUP_PASS_LABEL, ui::BUNDLE_PASS_LABEL);
+        assert!(!BACKUP_PASS_LABEL.contains("Paket"), "{BACKUP_PASS_LABEL}");
+    }
 }

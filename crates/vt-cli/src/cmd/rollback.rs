@@ -267,7 +267,7 @@ fn report_secret_write(vt_home: &Path, session: &str) -> Result<Option<SecretWri
 /// terminal, or `None` when neither is possible.
 fn passphrase(args: &RollbackArgs) -> Result<Option<SecretString>> {
     if args.passphrase_stdin || ui::interactive() {
-        return ui::read_passphrase_stdin(false).map(Some);
+        return ui::read_passphrase_stdin(false, ui::BUNDLE_PASS_LABEL).map(Some);
     }
     Ok(None)
 }

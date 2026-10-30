@@ -245,6 +245,8 @@ fn link_one(
         work_dir: &work_dir,
     };
     let plan = build_link_plan(env, &input, &mut Questions(prompter))?;
+    // The plan may have asked questions: Claude can have started since.
+    ui::wait_until_closed("Claude", "Bağlamadan önce", &|| ctx.claude_pids())?;
     let applied = apply::apply(
         &plan.plan,
         &env.vt_home,

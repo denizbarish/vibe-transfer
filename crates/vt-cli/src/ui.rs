@@ -82,13 +82,16 @@ pub fn confirm_while_running(tool_name: &str, pids: &[u32]) -> Result<()> {
     Ok(())
 }
 
-/// Reads the passphrase from stdin. On a terminal it is typed without echo
-/// (twice when `confirm`); otherwise the first line is used.
-pub fn read_passphrase_stdin(confirm: bool) -> Result<SecretString> {
+/// Prompt label of the bundle passphrase.
+pub const BUNDLE_PASS_LABEL: &str = "Paket parolası";
+
+/// Reads a passphrase from stdin. On a terminal it is typed without echo
+/// under `label` (twice when `confirm`); otherwise the first line is used.
+pub fn read_passphrase_stdin(confirm: bool, label: &str) -> Result<SecretString> {
     let pass = if io::stdin().is_terminal() {
-        let mut prompt = Password::new().with_prompt("Paket parolası");
+        let mut prompt = Password::new().with_prompt(label);
         if confirm {
-            prompt = prompt.with_confirmation("Paket parolası (tekrar)", "Parolalar eşleşmedi");
+            prompt = prompt.with_confirmation(format!("{label} (tekrar)"), "Parolalar eşleşmedi");
         }
         prompt.interact().context("parola okunamadı")?
     } else {
@@ -113,7 +116,7 @@ pub fn prompt_passphrase() -> Result<SecretString> {
     if !interactive() {
         bail!("parola için terminal yok; parolayı --passphrase-stdin ile verin");
     }
-    read_passphrase_stdin(false)
+    read_passphrase_stdin(false, BUNDLE_PASS_LABEL)
 }
 
 /// Fails unless a generated passphrase can be shown on a terminal: written
@@ -130,7 +133,7 @@ pub fn ensure_passphrase_display() -> Result<()> {
 /// Shows a generated passphrase once, on stderr (a terminal).
 pub fn show_passphrase(pass: &SecretString) {
     eprintln!();
-    eprintln!("Paket parolası (yalnız şimdi gösterilir):");
+    eprintln!("{BUNDLE_PASS_LABEL} (yalnız şimdi gösterilir):");
     eprintln!();
     eprintln!("    {}", pass.expose_secret());
     eprintln!();
@@ -210,6 +213,10 @@ pub struct Answers {
     /// the real machine, not the synthetic home).
     #[serde(default)]
     pub claude_pids: Vec<u32>,
+    /// How many process checks see no Claude before `claude_pids` apply:
+    /// a Claude started while the questions were answered.
+    #[serde(default)]
+    pub claude_pids_after: u32,
 }
 
 impl Answers {

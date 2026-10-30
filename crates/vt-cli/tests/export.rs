@@ -263,7 +263,7 @@ fn export_truncates_partial_jsonl_tail() {
     torn.extend_from_slice(b"{\"type\":\"user\",\"cwd\":\"/half");
     fs::write(&path, &torn).unwrap();
 
-    let (bundle, _) = export(&fx, "c.vtb", &[]);
+    let (bundle, output) = export(&fx, "c.vtb", &["--json"]);
     let read = open(&fx, &bundle);
     let entry = read
         .manifest
@@ -272,6 +272,27 @@ fn export_truncates_partial_jsonl_tail() {
         .find(|e| e.root == RootKind::ClaudeDir && e.rel == SESSION_REL)
         .unwrap();
     assert!(entry.partial_tail);
+    // The cut is reported, with the byte count, in the summary and the
+    // manifest notes (which the import shows and reports).
+    let cut = torn.len() - complete.len();
+    let reason = format!("son satır tamamlanmamış, {cut} bayt alınmadı");
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let skipped = summary["skipped"].as_array().unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|i| i["path"].as_str().unwrap().contains(SESSION_REL)
+                && i["reason"] == reason.as_str()),
+        "{skipped:?}"
+    );
+    assert!(
+        read.manifest
+            .notes
+            .iter()
+            .any(|n| n.contains(SESSION_REL) && n.ends_with(&reason)),
+        "{:?}",
+        read.manifest.notes
+    );
     let blob = fs::read(read.blobs.join(entry.index.to_string())).unwrap();
     assert_eq!(blob, complete);
     assert_eq!(entry.size, complete.len() as u64);

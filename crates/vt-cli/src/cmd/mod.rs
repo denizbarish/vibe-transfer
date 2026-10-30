@@ -10,6 +10,7 @@ pub mod rollback;
 pub mod scan;
 pub mod verify;
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,12 +49,18 @@ const TEST_FAIL_SET_VAR: &str = "VT_TEST_FAIL_SECRET_SET";
 pub struct Ctx {
     pub env: VtEnv,
     pub store: Box<dyn SecretStore>,
-    /// Set by `VT_TEST_HOME`: synthetic data, never the real home or Keychain.
+    /// Set by `VT_TEST_HOME`: every path is below that directory and secrets
+    /// live in memory, never in the Keychain. `VT_TEST_HOME` (and with it
+    /// every `VT_TEST_*` hook) is refused when, resolved, it is or contains
+    /// the account's home from the passwd entry; other real folders are
+    /// not checked.
     pub test_mode: bool,
     /// Test answers (`VT_TEST_ANSWERS`); `None` outside test mode.
     pub answers: Option<Answers>,
     /// The in-memory store in test mode, for the digest dump.
     test_store: Option<Arc<MemStore>>,
+    /// Test mode: process checks done so far (see `Answers::claude_pids_after`).
+    pid_checks: Cell<u32>,
 }
 
 /// Shares the test `MemStore` between `Ctx::store` and the dump; the flag
@@ -80,6 +87,48 @@ struct TestSecret {
     service: String,
     account: String,
     value: String,
+}
+
+/// Whether the test hooks may run against `test_home`: not when it is the
+/// account home or one of its parents (both already resolved).
+fn test_home_allowed(test_home: &Path, account_home: &Path) -> bool {
+    !account_home.starts_with(test_home)
+}
+
+/// Home directory of the account in the passwd entry of the real user id.
+/// Unlike `$HOME`, no environment variable changes it.
+fn account_home() -> Result<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: an all-zero `passwd` is a valid value (null pointers and
+        // zero ids); `getpwuid_r` only writes into `pwd` and `buf`, whose
+        // length is passed with it, and `result` points at `pwd` or is null.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            bail!("hesabın ev dizini kullanıcı kaydından okunamadı");
+        }
+        // SAFETY: on success `pw_dir` is a NUL-terminated string in `buf`,
+        // which outlives this borrow.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        return Ok(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+    }
 }
 
 impl Ctx {
@@ -112,12 +161,24 @@ impl Ctx {
                 test_mode: false,
                 answers: None,
                 test_store: None,
+                pid_checks: Cell::new(0),
             });
         };
 
         let home = PathBuf::from(home);
         if !home.is_absolute() {
             bail!("{TEST_HOME_VAR} mutlak bir yol olmalı");
+        }
+        let resolved = fs::canonicalize(&home)
+            .with_context(|| format!("{TEST_HOME_VAR} çözülemedi: {}", home.display()))?;
+        let account = account_home()?;
+        let account = fs::canonicalize(&account).unwrap_or(account);
+        if !test_home_allowed(&resolved, &account) {
+            bail!(
+                "{TEST_HOME_VAR} gerçek ev dizinini kapsıyor ({}); test kancaları yalnız \
+                 ayrı bir sentetik klasörle kullanılabilir",
+                account.display()
+            );
         }
         let user = std::env::var("USER")
             .ok()
@@ -148,6 +209,7 @@ impl Ctx {
             test_mode: true,
             answers,
             test_store: Some(store),
+            pid_checks: Cell::new(0),
         })
     }
 
@@ -155,9 +217,12 @@ impl Ctx {
     /// ignored (it belongs to the real machine) and the test answers decide.
     pub fn claude_pids(&self) -> Vec<u32> {
         if self.test_mode {
+            let done = self.pid_checks.get();
+            self.pid_checks.set(done + 1);
             return self
                 .answers
                 .as_ref()
+                .filter(|a| done >= a.claude_pids_after)
                 .map(|a| a.claude_pids.clone())
                 .unwrap_or_default();
         }
@@ -332,4 +397,31 @@ fn blake3_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_home_containing_the_account_home_is_refused() {
+        let account = Path::new("/Users/alice");
+        for refused in ["/Users/alice", "/Users", "/"] {
+            assert!(!test_home_allowed(Path::new(refused), account), "{refused}");
+        }
+        for allowed in [
+            "/Users/alice/tmp/fixture",
+            "/Users/alice2",
+            "/private/tmp/x",
+        ] {
+            assert!(test_home_allowed(Path::new(allowed), account), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn account_home_comes_from_the_passwd_entry() {
+        // Only read, never used as a test home.
+        let home = account_home().unwrap();
+        assert!(home.is_absolute(), "{}", home.display());
+    }
 }
