@@ -11,6 +11,7 @@ pub mod pathmap;
 pub mod pending;
 pub mod procs;
 pub mod remote;
+pub mod report;
 pub mod scan;
 pub mod secret_types;
 pub mod selection;

@@ -22,6 +22,8 @@ enum Command {
     Scan(ScanArgs),
     /// Seçilen verileri şifreli bir paket dosyasına yazar.
     Export(ExportArgs),
+    /// Bir paket dosyasını bu makineye uygular.
+    Import(ImportArgs),
 }
 
 #[derive(Args)]
@@ -59,11 +61,32 @@ pub struct ExportArgs {
     pub json: bool,
 }
 
+#[derive(Args)]
+pub struct ImportArgs {
+    /// Uygulanacak paket dosyası.
+    #[arg(value_name = "dosya")]
+    pub file: PathBuf,
+    /// Projelerin aranacağı klasörler (varsayılan: ev dizini).
+    #[arg(long, value_name = "yol,..", value_delimiter = ',')]
+    pub roots: Vec<PathBuf>,
+    /// Parolayı standart girdiden okur.
+    #[arg(long)]
+    pub passphrase_stdin: bool,
+    /// Özeti JSON olarak yazar.
+    #[arg(long)]
+    pub json: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = cmd::Ctx::from_process().and_then(|ctx| match &cli.command {
-        Command::Scan(args) => cmd::scan::run(&ctx, args),
-        Command::Export(args) => cmd::export::run(&ctx, args),
+    let result = cmd::Ctx::from_process().and_then(|ctx| {
+        let result = match &cli.command {
+            Command::Scan(args) => cmd::scan::run(&ctx, args),
+            Command::Export(args) => cmd::export::run(&ctx, args),
+            Command::Import(args) => cmd::import::run(&ctx, args),
+        };
+        let dumped = ctx.dump_test_secrets();
+        result.and(dumped)
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,

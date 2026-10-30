@@ -23,4 +23,5 @@ vt-secrets = { path = "../vt-secrets" }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+blake3 = "1.8.7"
 tempfile = "3.27.0"

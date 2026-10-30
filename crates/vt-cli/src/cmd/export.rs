@@ -78,7 +78,7 @@ pub fn run(ctx: &Ctx, args: &ExportArgs) -> Result<()> {
     })?;
     // Everything that can fail fast does so before any data is read.
     let given = if args.passphrase_stdin {
-        Some(ui::read_passphrase_stdin()?)
+        Some(ui::read_passphrase_stdin(true)?)
     } else {
         ui::ensure_passphrase_display()?;
         None

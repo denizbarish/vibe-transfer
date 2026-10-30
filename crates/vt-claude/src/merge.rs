@@ -103,6 +103,72 @@ fn merge_entries(
     }
 }
 
+/// Merges a source JSON settings document (`settings.json`, plugin
+/// registries, `.mcp.json`; paths already rewritten) into the target's, key
+/// by key: missing keys are added, objects are merged recursively, arrays
+/// are united (target order first), and a differing scalar or type is a
+/// conflict. For each conflict `take_source` decides: `true` puts the
+/// source value in, `false` keeps the target's. Returns the conflicts.
+///
+/// A non-object on either side is one conflict on the whole document
+/// (path `""`).
+pub fn merge_json_settings(
+    target: &mut Value,
+    source: &Value,
+    take_source: &mut dyn FnMut(&JsonConflict) -> bool,
+) -> Vec<JsonConflict> {
+    let mut conflicts = Vec::new();
+    merge_value(target, source, "", take_source, &mut conflicts);
+    conflicts
+}
+
+fn merge_value(
+    target: &mut Value,
+    source: &Value,
+    path: &str,
+    take_source: &mut dyn FnMut(&JsonConflict) -> bool,
+    conflicts: &mut Vec<JsonConflict>,
+) {
+    if target == source {
+        return;
+    }
+    match (&mut *target, source) {
+        (Value::Object(dst), Value::Object(src)) => {
+            for (key, src_value) in src {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match dst.get_mut(key) {
+                    None => {
+                        dst.insert(key.clone(), src_value.clone());
+                    }
+                    Some(dst_value) => {
+                        merge_value(dst_value, src_value, &child, take_source, conflicts);
+                    }
+                }
+            }
+        }
+        (Value::Array(_), Value::Array(_)) if !path.is_empty() => {
+            if let Some(merged) = union_arrays(target, source) {
+                *target = merged;
+            }
+        }
+        _ => {
+            let c = JsonConflict {
+                path: path.to_owned(),
+                source: source.clone(),
+                target: target.clone(),
+            };
+            if take_source(&c) {
+                *target = source.clone();
+            }
+            conflicts.push(c);
+        }
+    }
+}
+
 /// Union of two arrays: `target` in order, then `source` items it lacks.
 fn union_arrays(target: &Value, source: &Value) -> Option<Value> {
     let (Value::Array(t), Value::Array(s)) = (target, source) else {

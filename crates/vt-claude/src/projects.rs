@@ -218,7 +218,7 @@ fn session_cwds(claude_dir: &Path, notes: &mut Vec<(String, String)>) -> Vec<Str
     out
 }
 
-fn first_cwds(
+pub(crate) fn first_cwds(
     path: &Path,
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,

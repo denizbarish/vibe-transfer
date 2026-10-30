@@ -5,6 +5,7 @@
 mod claude_json;
 mod inventory;
 mod merge;
+mod plan;
 mod projects;
 mod transform;
 
@@ -12,7 +13,12 @@ use vt_core::VtEnv;
 
 pub use claude_json::read_claude_json_stable;
 pub use inventory::{Inventory, classify, item_key};
-pub use merge::{merge_claude_json, merge_memory_md};
+pub use merge::{merge_claude_json, merge_json_settings, merge_memory_md};
+pub use plan::{
+    ClaudePlan, KIND_CLAUDE_JSON_MERGE, KIND_HOME_PATHS, KIND_JSON_MERGE, KIND_JSON_PATHS,
+    KIND_MEMORY_MERGE, KIND_SYMLINK_TARGET, PlanInput, PlanQuestions, SessionStats,
+    build_claude_apply_plan, resolve_dest_template,
+};
 pub use projects::project_inner_files;
 pub use transform::{
     CLAUDE_REWRITE_JSONL_CWD, RewriteOutcome, memory_slug_for, rewrite_json_paths,

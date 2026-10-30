@@ -112,6 +112,60 @@ pub(crate) fn identity(pass: &age::secrecy::SecretString) -> age::scrypt::Identi
     identity
 }
 
+/// Writes `plaintext` age-encrypted with `pass` to the new file `path`
+/// (owner-only; fails if it exists). Used for secret backups, which must
+/// never touch the disk in clear.
+pub fn encrypt_to_file(
+    path: &std::path::Path,
+    pass: &age::secrecy::SecretString,
+    plaintext: &[u8],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    use anyhow::Context;
+
+    let file = crate::fsutil::create_private_file(path)
+        .with_context(|| format!("oluşturulamadı: {}", path.display()))?;
+    let result = (|| -> anyhow::Result<()> {
+        let mut out = encryptor(pass).wrap_output(std::io::BufWriter::new(file))?;
+        out.write_all(plaintext)?;
+        let file = out.finish()?.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result.with_context(|| format!("şifreli dosya yazılamadı: {}", path.display()))
+}
+
+/// Reads a file written by [`encrypt_to_file`].
+pub fn decrypt_file(
+    path: &std::path::Path,
+    pass: &age::secrecy::SecretString,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::{BufReader, Read};
+
+    use anyhow::Context;
+
+    let file =
+        std::fs::File::open(path).with_context(|| format!("açılamadı: {}", path.display()))?;
+    let id = identity(pass);
+    let mut reader = age::Decryptor::new_buffered(BufReader::new(file))
+        .and_then(|d| d.decrypt(std::iter::once(&id as &dyn age::Identity)))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "çözülemedi (parola yanlış ya da dosya bozuk): {}",
+                path.display()
+            )
+        })?;
+    let mut out = zeroize::Zeroizing::new(Vec::new());
+    reader
+        .read_to_end(&mut out)
+        .with_context(|| format!("okunamadı: {}", path.display()))?;
+    Ok(out)
+}
+
 /// Test support only: decrypts the inner stream of `path`, lets `edit` change
 /// it and re-encrypts it in place. Holds the whole bundle in memory.
 #[cfg(feature = "test-util")]
