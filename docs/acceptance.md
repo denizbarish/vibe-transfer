@@ -109,11 +109,14 @@ Paketi hedefe bir kanaldan, parolayı başka bir kanaldan iletin.
   Komut: içe aktarmadan sonra Claude Code'un token'ı yenilemesini bekleyin (bölüm 3), sonra `vibe-transfer rollback`, ilk onaya `y`, sır sorusuna `n`.
   Beklenen: `Claude Code-credentials kaydı içe aktarmadan sonra değişmiş (ör. token yenilendi). Yine de geri alınsın mı?` sorusu; `n` sonrası `UYARI: sır adımı geri alınmadı, bekliyor: ...` ve çıkış kodu 1, dosyalar geri alınmış. Tekrar `vibe-transfer rollback <hedef-oturum>` ve iki soruya `y`: `İçe aktarılan sır, sır deposundan kaldırıldı.` ve `Not: sır içe aktarmadan sonra değişmişti (ör. token yenilendi); yine de geri alındı.`
 
-## 7. Açık tasarım sorusu: CLAUDE_CONFIG_DIR
+## 7. CLAUDE_CONFIG_DIR ile eski `~/.claude`
 
-- [ ] Kaynakta `CLAUDE_CONFIG_DIR` tanımlı ve eski bir `~/.claude` da duruyorsa ne raporlandığı not edildi.
-  Komut: `CLAUDE_CONFIG_DIR=/Users/alice/claude-alt vibe-transfer scan` (kaynakta hem `/Users/alice/claude-alt` hem eski `~/.claude` dolu)
-  Beklenen (şimdiki kod): `Claude Code: /Users/alice/claude-alt`; eski `~/.claude` taranmaz ve raporda anılmaz. Bunun doğru davranış olup olmadığı açık bir tasarım sorusudur; gözlenen çıktıyı not edin, karar kullanıcıya aittir.
+- [ ] Kaynakta `CLAUDE_CONFIG_DIR` tanımlı, eski bir `~/.claude` duruyor ve ev dizini proje olarak kayıtlı: yalnız proje ayarları aktarılır.
+  Komut: `CLAUDE_CONFIG_DIR=/Users/alice/claude-alt vibe-transfer scan` (kaynakta hem `/Users/alice/claude-alt` hem eski `~/.claude` dolu, Claude Code bir kez `~` içinde açılmış)
+  Beklenen: ev projesi altında eski `~/.claude` içinden yalnız `settings.json`, `settings.local.json`, `agents/`, `commands/`, `skills/` ve `CLAUDE.md` listelenir; oturumlar, geçmiş ve diğer durum dosyaları listelenmez. Notlarda `yalnız proje ayarları (settings*.json, agents, commands, skills, CLAUDE.md) aktarıldı` görünür.
+- [ ] Hedefte `CLAUDE_CONFIG_DIR` tanımlı değilse bu öğeler yazılmaz.
+  Komut: paketi `CLAUDE_CONFIG_DIR` olmadan `vibe-transfer import` ile içe aktarın.
+  Beklenen: hedefin `~/.claude/settings.json` dosyası değişmez; öğeler `CLAUDE_CONFIG_DIR'i kaynaktaki gibi ayarlayıp paketi yeniden içe aktarın` gerekçesiyle taşınmayanlar arasında görünür. Aynı paket `CLAUDE_CONFIG_DIR` ayarlıyken içe aktarıldığında öğeler `~/.claude/` altına yazılır.
 
 ## 8. Diğer
 

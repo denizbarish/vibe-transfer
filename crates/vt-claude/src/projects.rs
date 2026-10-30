@@ -30,6 +30,16 @@ const WORKTREES_DENIED: &str = "proje .claude/worktrees klasörü kod içerir, t
 const SECRET_DENIED: &str = "dosya olarak asla taşınmaz: sır";
 const NEVER_DENIED: &str = "asla taşınmaz: makineye özgü";
 const VARIANT_DENIED: &str = "büyük/küçük harf veya Unicode varyantı, .claude ile çakışır";
+/// What a project reads from its `.claude/`: the part of a stale home
+/// `.claude` that still acts as project config when Claude runs in `~`.
+const PROJECT_SHAPED: &[&str] = &[
+    "settings.json",
+    "settings.local.json",
+    "agents",
+    "commands",
+    "skills",
+    "claude.md",
+];
 
 /// Projects found plus what could not be used, keyed like `Inventory`.
 pub(crate) struct ProjectScan {
@@ -265,7 +275,7 @@ fn sorted_dir(dir: &Path) -> Vec<PathBuf> {
 /// the inventory reports such errors instead.
 pub fn project_inner_files(project_root: &Path) -> Vec<String> {
     let opts = ProjectScanOptions {
-        skip_dot_claude: false,
+        dot_claude: DotClaudeScope::All,
         nested: true,
         excluded: &[],
     };
@@ -410,11 +420,23 @@ pub(crate) fn fold(name: &str) -> String {
     out
 }
 
+/// Which part of a project's `.claude/` [`scan_project`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DotClaudeScope {
+    /// Everything but the denied names.
+    All,
+    /// Nothing: the home directory as a project, whose `.claude/` is the
+    /// Claude dir itself (already its own root).
+    None,
+    /// Only the project config (settings, agents, commands, skills,
+    /// CLAUDE.md): a stale home `.claude` with `CLAUDE_CONFIG_DIR` elsewhere.
+    ProjectShaped,
+}
+
 /// How [`scan_project`] walks one project.
 pub(crate) struct ProjectScanOptions<'a> {
-    /// Leave out `.claude/`: the home directory as a project, whose
-    /// `.claude/` is the Claude dir itself (already its own root).
-    pub skip_dot_claude: bool,
+    /// Which part of `.claude/` is scanned.
+    pub dot_claude: DotClaudeScope,
     /// Search subdirectories for nested `CLAUDE.md` files.
     pub nested: bool,
     /// Other project roots; never walked into.
@@ -450,8 +472,14 @@ pub(crate) fn scan_project(
             DotClaude::Other => {}
         }
         if parts[0] == ".claude" {
-            if opts.skip_dot_claude {
-                return true;
+            match opts.dot_claude {
+                DotClaudeScope::None => return true,
+                DotClaudeScope::ProjectShaped
+                    if parts.len() > 1 && !PROJECT_SHAPED.contains(&fold(parts[1]).as_str()) =>
+                {
+                    return true;
+                }
+                _ => {}
             }
             if let Some(reason) = dot_claude_denial(&parts[1..].join("/")) {
                 unreadable

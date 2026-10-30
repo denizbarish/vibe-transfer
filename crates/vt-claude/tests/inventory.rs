@@ -590,7 +590,7 @@ fn project_scan_prunes_case_variants_and_never_names() {
 }
 
 #[test]
-fn stale_home_claude_dir_with_config_override_is_dropped() {
+fn stale_home_claude_dir_moves_only_project_config() {
     let (_tmp, base) = setup();
     let home = base.home.clone();
     let cfg = home.join("cfg");
@@ -602,6 +602,8 @@ fn stale_home_claude_dir_with_config_override_is_dropped() {
     )
     .unwrap();
     fs::write(home.join("CLAUDE.md"), "# Home\n").unwrap();
+    fs::write(home.join(".claude/settings.local.json"), "{}").unwrap();
+    fs::write(home.join(".claude/commands.md"), "x").unwrap();
     let env = VtEnv::new(home.clone(), "alice".into(), Some(cfg));
     let inv = ClaudeAdapter { env }
         .inventory(&selection(DEFAULT))
@@ -609,18 +611,48 @@ fn stale_home_claude_dir_with_config_override_is_dropped() {
 
     let home_root = RootKind::Project(ProjectId(format!("path:{}", home.display())));
     let home_rels = rels(&inv, &home_root);
-    assert_eq!(home_rels, vec!["CLAUDE.md"], "{home_rels:?}");
-    let note = inv
-        .skipped
-        .iter()
-        .find(|(k, _)| k == &format!("project:path:{}:.claude", home.display()))
-        .map(|(_, r)| r.clone())
-        .unwrap_or_default();
-    assert!(note.contains("CLAUDE_CONFIG_DIR"), "{:?}", inv.skipped);
+    for rel in [
+        "CLAUDE.md",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+        ".claude/agents/reviewer.md",
+        ".claude/CLAUDE.md",
+        ".claude/skills/local-skill",
+    ] {
+        assert!(home_rels.iter().any(|r| r == rel), "{rel}: {home_rels:?}");
+    }
+    // Sessions, history, state and the rest of the old Claude dir stay.
+    for top in [
+        "projects",
+        "history.jsonl",
+        "sessions",
+        "file-history",
+        "plugins",
+        "hooks",
+        "plans",
+        "mystery.txt",
+        "commands.md",
+        "daemon",
+    ] {
+        let prefix = format!(".claude/{top}");
+        assert!(
+            !home_rels
+                .iter()
+                .any(|r| r == &prefix || r.starts_with(&format!("{prefix}/"))),
+            "{top}: {home_rels:?}"
+        );
+    }
+    let note = home_dot_claude_note_in(&inv.notes, &home).unwrap_or_default();
+    assert!(note.contains("CLAUDE_CONFIG_DIR"), "{:?}", inv.notes);
     assert!(
         note.contains(home.join(".claude").to_str().unwrap()),
         "{note}"
     );
+}
+
+fn home_dot_claude_note_in(list: &[(String, String)], home: &Path) -> Option<String> {
+    let key = format!("project:path:{}:.claude", home.display());
+    list.iter().find(|(k, _)| k == &key).map(|(_, r)| r.clone())
 }
 
 /// The home project's `.claude` notes, by key.

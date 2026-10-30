@@ -11,7 +11,9 @@ use vt_core::manifest::{Category, Class, Entry, EntryKind, ProjectRef, RootKind,
 use vt_core::scan::{NON_UTF8_NAME, NON_UTF8_TARGET, RawEntry, scan_tree, stat_entry};
 
 use crate::ClaudeAdapter;
-use crate::projects::{ProjectScanOptions, UNREADABLE, fold, scan_project, unreadable_dir};
+use crate::projects::{
+    DotClaudeScope, ProjectScanOptions, UNREADABLE, fold, scan_project, unreadable_dir,
+};
 use crate::settings_refs::settings_refs;
 
 const UNSELECTED: &str = "kullanıcı seçimiyle atlandı";
@@ -22,11 +24,12 @@ const UNCLASSIFIED_NOTE: &str = "sınıflandırılmamış: isteğe bağlı öğe
 const SPECIAL: &str = "özel dosya";
 const EMPTY_DIR: &str = "içinde aktarılacak öğe yok";
 const MISSING_PROJECT: &str = "proje klasörü bu makinede yok";
-const STALE_CLAUDE_DIR: &str =
-    "eski Claude klasörü, CLAUDE_CONFIG_DIR başka yeri gösteriyor; proje verisi olarak aktarılmadı";
+const STALE_CLAUDE_DIR: &str = "eski Claude klasörü, CLAUDE_CONFIG_DIR başka yeri gösteriyor; \
+     yalnız proje ayarları (settings*.json, agents, commands, skills, CLAUDE.md) aktarıldı; \
+     bu ayarların çalıştırdığı hooks/ betikleri aktarılmadı";
 const INSIDE_CLAUDE_DIR: &str = "Claude klasörünün içinde, ayrıca taşınmaz";
-const STALE_HOME_CLAUDE_DIR: &str = "CLAUDE_CONFIG_DIR başka yeri gösteriyor; bu klasörün \
-     içeriği aktarılmadı, ne olacağına siz karar verin";
+const STALE_HOME_CLAUDE_DIR: &str = "CLAUDE_CONFIG_DIR başka yeri gösteriyor; bu klasördeki \
+     oturum ve hafıza aktarılmadı, ne olacağına siz karar verin";
 const REFERENCED_NOT_MOVED: &str =
     "settings.json bu dosyayı çalıştırıyor ama dosya aktarılmıyor; hedefte eksik kalır";
 
@@ -537,24 +540,30 @@ impl Collector<'_> {
             return;
         }
         // With CLAUDE_CONFIG_DIR the live Claude dir is elsewhere; the home's
-        // `.claude` is a stale one, not project data.
+        // `.claude` is a stale one. Claude still reads its project config
+        // when run in `~`, so only that part moves.
         let stale = env.claude_config_dir_override.is_some()
             && same_path(root, &env.home)
             && fs::symlink_metadata(root.join(".claude")).is_ok()
             && !same_path(&root.join(".claude"), claude_dir);
         if stale {
-            self.skip(
-                &root_kind,
-                ".claude",
+            self.notes.push((
+                item_key(&root_kind, ".claude"),
                 format!(
                     "{STALE_CLAUDE_DIR} ({}; CLAUDE_CONFIG_DIR: {})",
                     root.join(".claude").display(),
                     claude_dir.display()
                 ),
-            );
+            ));
         }
         let opts = ProjectScanOptions {
-            skip_dot_claude: stale || same_path(&root.join(".claude"), claude_dir),
+            dot_claude: if stale {
+                DotClaudeScope::ProjectShaped
+            } else if same_path(&root.join(".claude"), claude_dir) {
+                DotClaudeScope::None
+            } else {
+                DotClaudeScope::All
+            },
             // The home dir (or a parent of it) is never walked for nested
             // CLAUDE.md files: it holds other projects and protected folders.
             nested: !env.home.starts_with(root),

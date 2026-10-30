@@ -422,6 +422,10 @@ pub fn build_link_plan(
     b.finish()
 }
 
+/// Why a home project's `.claude` item is not written on this target.
+const HOME_DOT_CLAUDE_SKIPPED: &str = "bu projenin .claude klasörü hedefte Claude'un kendi \
+     klasörü, yazılmadı; CLAUDE_CONFIG_DIR'i kaynaktaki gibi ayarlayıp paketi yeniden içe aktarın";
+
 /// Whether `rel` (in the Claude dir) names the target `~/.claude.json`, as
 /// it does with `CLAUDE_CONFIG_DIR`: compared as a case-insensitive file
 /// system would, and by file identity.
@@ -531,7 +535,9 @@ impl Builder<'_> {
             .with_context(|| format!("manifestte olmayan proje: {}", id.0))?;
         let d = q.project_decision(project, root)?;
         self.project_decisions.insert(id.clone(), d);
-        if d == Decision::Replace {
+        // A project whose `.claude` is the live Claude dir (the home) gets
+        // no mirror scope: replacing it would clear the whole Claude dir.
+        if d == Decision::Replace && !dot_claude_is_claude_dir(root, &self.env.claude_dir) {
             self.project_scopes.insert(id.clone(), root.join(".claude"));
         }
         Ok(d)
@@ -546,14 +552,16 @@ impl Builder<'_> {
         match self.mapping(id).cloned() {
             Some(root) => {
                 let in_dot_claude = e.rel == ".claude" || e.rel.starts_with(".claude/");
+                // The home project's `.claude` from a source with
+                // CLAUDE_CONFIG_DIR: here it is the Claude dir itself, so it
+                // is never written; the bundle keeps it for a later import.
                 if in_dot_claude && dot_claude_is_claude_dir(&root, &self.env.claude_dir) {
-                    bail!(
-                        "{} projesinin .claude klasörü hedefin Claude klasörü ({}); proje \
-                         içindeki .claude öğeleri oraya yazılmaz: {:?}; içe aktarma reddedildi",
-                        id.0,
-                        self.env.claude_dir.display(),
-                        e.rel
+                    let reason = format!(
+                        "{HOME_DOT_CLAUDE_SKIPPED} ({})",
+                        self.env.claude_dir.display()
                     );
+                    self.skip(e, &reason);
+                    return Ok(());
                 }
                 let owner = Owner::Project(id.clone(), root.clone());
                 self.entry(&owner, &root, e, &e.rel, project_rule(&e.rel), q)

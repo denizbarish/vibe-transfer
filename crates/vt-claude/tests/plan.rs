@@ -402,7 +402,7 @@ fn case_and_normalization_variants_of_denied_names_are_rejected() {
 }
 
 #[test]
-fn home_mapped_project_never_writes_into_the_live_claude_dir() {
+fn home_mapped_project_dot_claude_is_skipped_not_written_into_the_live_claude_dir() {
     let fx = fx();
     let live = fx.env.claude_dir.join("settings.json");
     fs::create_dir_all(&fx.env.claude_dir).unwrap();
@@ -426,8 +426,19 @@ fn home_mapped_project_never_writes_into_the_live_claude_dir() {
             file(&fx, 0, root.clone(), rel, b"{\"evil\":true}")
         };
         let rb = bundle(&fx, vec![entry], vec![project.clone()]);
-        let err = plan(&fx, &rb, &mappings).unwrap_err();
-        assert!(format!("{err:#}").contains("Claude klasörü"), "{err:#}");
+        let p = plan(&fx, &rb, &mappings).unwrap();
+        assert!(
+            p.plan.placements.is_empty(),
+            "{rel}: {:?}",
+            p.plan.placements
+        );
+        assert!(
+            p.skipped
+                .iter()
+                .any(|(_, r)| r.contains("CLAUDE_CONFIG_DIR")),
+            "{rel}: {:?}",
+            p.skipped
+        );
     }
     assert_eq!(fs::read(&live).unwrap(), b"{\"live\":true}");
 
@@ -439,6 +450,72 @@ fn home_mapped_project_never_writes_into_the_live_claude_dir() {
     );
     let p = plan(&fx, &rb, &mappings).unwrap();
     assert_eq!(p.plan.placements[0].dest, fx.env.home.join("CLAUDE.md"));
+}
+
+/// Answers Replace for every project and keeps the source for files.
+struct ReplaceProjects;
+
+impl PlanQuestions for ReplaceProjects {
+    fn project_decision(&mut self, _: &ProjectRef, _: &Path) -> Result<Decision> {
+        Ok(Decision::Replace)
+    }
+    fn file(&mut self, _: &Path) -> Result<Resolution> {
+        Ok(Resolution::KeepSource)
+    }
+    fn json(&mut self, _: &JsonConflict) -> Result<Resolution> {
+        Ok(Resolution::KeepSource)
+    }
+}
+
+#[test]
+fn replacing_the_home_project_never_clears_the_live_claude_dir() {
+    let fx = fx();
+    fs::create_dir_all(&fx.env.claude_dir).unwrap();
+    fs::write(fx.env.claude_dir.join(".credentials.json"), b"{}").unwrap();
+    // A differing home CLAUDE.md makes the project decision come up.
+    fs::write(fx.env.home.join("CLAUDE.md"), b"# target\n").unwrap();
+    let id = ProjectId(format!("path:{}", "/Users/alice"));
+    let project = ProjectRef {
+        id: id.clone(),
+        old_path: "/Users/alice".into(),
+        remote: None,
+        is_git: false,
+    };
+    let root = RootKind::Project(id.clone());
+    let mut mappings = BTreeMap::new();
+    mappings.insert(id, Mapping::Auto(fx.env.home.clone()));
+    let rb = bundle(
+        &fx,
+        vec![
+            file(&fx, 0, root.clone(), "CLAUDE.md", b"# home\n"),
+            file(&fx, 1, root, ".claude/settings.json", b"{}"),
+        ],
+        vec![project],
+    );
+    let input = PlanInput {
+        mappings: &mappings,
+        decision: Decision::Merge,
+        take_oauth: false,
+        session_id: "t",
+        work_dir: &fx.work,
+    };
+    let p = build_claude_apply_plan(&rb, &fx.env, &input, &mut ReplaceProjects).unwrap();
+    assert!(
+        !p.plan
+            .replace_scopes
+            .iter()
+            .any(|s| fx.env.claude_dir.starts_with(&s.dir) || s.dir.starts_with(&fx.env.claude_dir)),
+        "{:?}",
+        p.plan.replace_scopes
+    );
+    assert!(
+        p.plan
+            .placements
+            .iter()
+            .all(|pl| !pl.dest.starts_with(&fx.env.claude_dir)),
+        "{:?}",
+        p.plan.placements
+    );
 }
 
 #[test]
