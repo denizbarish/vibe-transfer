@@ -190,6 +190,50 @@ fn export_creates_bundle_and_outbox() {
         assert!(!shown.contains(PASS), "passphrase leaked:\n{shown}");
     }
     assert!(stdout.contains(&m.session_id), "{stdout}");
+    assert!(
+        stderr.contains("Parolayı paket dosyasıyla aynı kanaldan gönderme"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn export_outbox_failure_keeps_usable_bundle() {
+    let fx = setup();
+    // An outbox nobody can write into: the session dir cannot be created.
+    let outbox = fx.home.join(".vibe-transfer/outbox");
+    fs::create_dir_all(&outbox).unwrap();
+    fs::set_permissions(&outbox, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let bundle = fx.out_dir.join("e.vtb");
+    let output = run(
+        &fx,
+        &[
+            "export",
+            "--out",
+            bundle.to_str().unwrap(),
+            "--passphrase-stdin",
+        ],
+        &format!("{PASS}\n"),
+    );
+    fs::set_permissions(&outbox, fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = text(&output.stderr);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("paket geçerli ve kullanılabilir"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("oturum kaydı"), "{stderr}");
+    assert!(
+        stderr.contains("Parolayı paket dosyasıyla aynı kanaldan gönderme"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(PASS), "{stderr}");
+    // The bundle survived and opens with the passphrase.
+    assert!(bundle.exists());
+    let read = open(&fx, &bundle);
+    assert!(!read.manifest.entries.is_empty());
+    assert_eq!(read.secrets.len(), 1);
 }
 
 #[test]

@@ -192,23 +192,39 @@ pub fn run(ctx: &Ctx, args: &ExportArgs) -> Result<()> {
     let written = writer.finish(&manifest)?;
     guard.done = true;
 
-    let out_path = fs::canonicalize(&args.out)
-        .with_context(|| format!("paket yolu çözülemedi: {}", args.out.display()))?;
-    write_outbox(
-        &ctx.env.vt_home,
-        &OutboxMeta {
-            session_id: &session_id,
-            created_at: &created_at,
-            secrets: &manifest.secrets,
-            out_path: out_path.to_string_lossy().into_owned(),
-        },
-    )
-    .context("paket yazıldı ama oturum kaydı yazılamadı")?;
-
+    // The bundle is complete: show the passphrase before anything else can
+    // fail, or the bundle would be locked with a passphrase nobody saw.
     if given.is_none() {
         ui::show_passphrase(&pass);
     }
     ui::warn_separate_channel();
+
+    let out_path = fs::canonicalize(&args.out)
+        .with_context(|| format!("paket yolu çözülemedi: {}", args.out.display()))
+        .and_then(|out_path| {
+            write_outbox(
+                &ctx.env.vt_home,
+                &OutboxMeta {
+                    session_id: &session_id,
+                    created_at: &created_at,
+                    secrets: &manifest.secrets,
+                    out_path: out_path.to_string_lossy().into_owned(),
+                },
+            )?;
+            Ok(out_path)
+        })
+        .with_context(|| {
+            let pass_note = if given.is_none() {
+                "parola yukarıda gösterildi"
+            } else {
+                "verilen parolayla açılır"
+            };
+            format!(
+                "paket geçerli ve kullanılabilir ({}; {pass_note}), ancak oturum kaydı \
+                 (outbox) yazılamadı; logout-source bu oturum için çalışmaz",
+                args.out.display()
+            )
+        })?;
 
     let files: Vec<&Entry> = manifest
         .entries
