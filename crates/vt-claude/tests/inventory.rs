@@ -619,3 +619,126 @@ fn stale_home_claude_dir_with_config_override_is_dropped() {
         "{note}"
     );
 }
+
+/// The home project's `.claude` notes, by key.
+fn home_dot_claude_note(inv: &Inventory, home: &Path) -> Option<String> {
+    let key = format!("project:path:{}:.claude", home.display());
+    inv.skipped
+        .iter()
+        .find(|(k, _)| k == &key)
+        .map(|(_, r)| r.clone())
+}
+
+#[test]
+fn config_override_naming_the_home_claude_dir_is_not_stale() {
+    // CLAUDE_CONFIG_DIR is `~/.claude` itself, then its symlink target.
+    for via_symlink in [false, true] {
+        let (_tmp, base) = setup();
+        let home = base.home.clone();
+        let cfg = if via_symlink {
+            let real = home.join("claude-real");
+            fs::rename(home.join(".claude"), &real).unwrap();
+            std::os::unix::fs::symlink("claude-real", home.join(".claude")).unwrap();
+            real
+        } else {
+            home.join(".claude")
+        };
+        fs::write(
+            cfg.join(".claude.json"),
+            serde_json::json!({"projects": {home.to_str().unwrap(): {}}}).to_string(),
+        )
+        .unwrap();
+        fs::write(home.join("CLAUDE.md"), "# Home\n").unwrap();
+        let env = VtEnv::new(home.clone(), "alice".into(), Some(cfg));
+        let inv = ClaudeAdapter { env }
+            .inventory(&selection(DEFAULT))
+            .unwrap();
+
+        let note = home_dot_claude_note(&inv, &home);
+        assert!(note.is_none(), "symlink {via_symlink}: {note:?}");
+        assert!(
+            !inv.skipped.iter().any(|(_, r)| r.contains("eski")),
+            "symlink {via_symlink}: {:?}",
+            inv.skipped
+        );
+        let home_root = RootKind::Project(ProjectId(format!("path:{}", home.display())));
+        let home_rels = rels(&inv, &home_root);
+        assert_eq!(home_rels, vec!["CLAUDE.md"], "symlink {via_symlink}");
+    }
+}
+
+#[test]
+fn project_claude_variant_folder_is_noted() {
+    let (_tmp, env) = setup();
+    let other = env.home.join("code/other");
+    fs::create_dir_all(other.join(".Claude")).unwrap();
+    fs::write(other.join(".Claude/CLAUDE.md"), "c").unwrap();
+    fs::write(other.join("CLAUDE.md"), "o").unwrap();
+    edit_claude_json(&env, |json| {
+        json["projects"]
+            .as_object_mut()
+            .unwrap()
+            .insert(other.to_str().unwrap().into(), serde_json::json!({}));
+    });
+    let inv = ClaudeAdapter { env: env.clone() }
+        .inventory(&selection(DEFAULT))
+        .unwrap();
+    let key = format!("project:path:{}:.Claude", other.display());
+    let reason = skip_reason(&inv, &key).unwrap_or_default();
+    assert!(
+        reason.contains("büyük/küçük harf veya Unicode varyantı, .claude ile çakışır"),
+        "{:?}",
+        inv.skipped
+    );
+    assert!(
+        reason.contains(other.join(".Claude").to_str().unwrap()),
+        "{reason}"
+    );
+}
+
+#[test]
+fn project_claude_keeps_user_content_and_drops_machine_state() {
+    let (_tmp, env) = setup();
+    let app = env.home.join("code/app");
+    let credential = format!(".claude/.credential{}.json", '\u{17F}');
+    for rel in [
+        ".claude/daemon-runbook.md",
+        ".claude/bun.lock",
+        ".claude/debug/notes.md",
+        ".claude/downloads/a.md",
+        ".claude/chrome/a.md",
+        ".claude/agents/ağ-uzmanı.md",
+        ".claude/sessions/x",
+        ".claude/scheduled_tasks.lock",
+        ".claude/.device-keys.json",
+        credential.as_str(),
+    ] {
+        fs::create_dir_all(app.join(rel).parent().unwrap()).unwrap();
+        fs::write(app.join(rel), "x").unwrap();
+    }
+    let inv = ClaudeAdapter { env: env.clone() }
+        .inventory(&selection(DEFAULT))
+        .unwrap();
+    let id = "github.com/acme/app";
+    let app_rels = rels(&inv, &RootKind::Project(ProjectId(id.into())));
+    for kept in [
+        ".claude/daemon-runbook.md",
+        ".claude/bun.lock",
+        ".claude/debug/notes.md",
+        ".claude/downloads/a.md",
+        ".claude/chrome/a.md",
+        ".claude/agents/ağ-uzmanı.md",
+    ] {
+        assert!(app_rels.contains(&kept.to_owned()), "{kept}: {app_rels:?}");
+    }
+    for (rel, word) in [
+        (".claude/sessions", "makineye"),
+        (".claude/scheduled_tasks.lock", "makineye"),
+        (".claude/.device-keys.json", "asla"),
+        (credential.as_str(), "sır"),
+    ] {
+        assert!(!app_rels.iter().any(|r| r.starts_with(rel)), "{rel}");
+        let reason = skip_reason(&inv, &format!("project:{id}:{rel}")).unwrap_or_default();
+        assert!(reason.contains(word), "{rel}: {:?}", inv.skipped);
+    }
+}

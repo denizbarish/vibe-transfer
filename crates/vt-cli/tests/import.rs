@@ -851,11 +851,74 @@ fn export_prunes_what_import_refuses_and_the_bundle_imports() {
         "{:?}",
         rb.manifest.notes
     );
+    let variant = fx.src_lost().join(".Claude");
+    assert!(
+        rb.manifest.notes.iter().any(|n| n
+            .contains("büyük/küçük harf veya Unicode varyantı, .claude ile çakışır")
+            && n.contains(variant.to_str().unwrap())),
+        "{:?}",
+        rb.manifest.notes
+    );
 
     let i = import(&fx, &bundle, None, None);
     ok(&i);
     assert!(fx.dst_app().join(".claude/settings.json").exists());
     assert!(!fx.dst_app().join(".claude/.credentials.json").exists());
+    let rep = report(&fx, &i);
+    assert_eq!(rep["problems"], json!([]), "{rep}");
+}
+
+#[test]
+fn project_claude_user_content_round_trips_and_machine_state_stays() {
+    let fx = setup();
+    let app = fx.src_app();
+    let credential = format!(".claude/.credential{}.json", '\u{17F}');
+    let kept = [
+        ".claude/daemon-runbook.md",
+        ".claude/bun.lock",
+        ".claude/debug/notes.md",
+        ".claude/agents/ağ-uzmanı.md",
+    ];
+    for rel in kept {
+        write(&app.join(rel), rel);
+    }
+    write(&app.join(".claude/sessions/x"), "{}");
+    write(&app.join(&credential), "{}");
+    let bundle = export(&fx);
+
+    let staging = fx.tmp.path().join("inspect");
+    let rb = vt_core::bundle::read_bundle(&bundle, &SecretString::from(PASS.to_owned()), &staging)
+        .unwrap();
+    let rels: Vec<&str> = rb
+        .manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e.root, vt_core::manifest::RootKind::Project(_)))
+        .map(|e| e.rel.as_str())
+        .collect();
+    for rel in kept {
+        assert!(rels.contains(&rel), "{rel}: {rels:?}");
+    }
+    for denied in [".claude/sessions", credential.as_str()] {
+        assert!(!rels.iter().any(|r| r.starts_with(denied)), "{denied}");
+        assert!(
+            rb.manifest.notes.iter().any(|n| n.contains(denied)),
+            "{denied}: {:?}",
+            rb.manifest.notes
+        );
+    }
+
+    let i = import(&fx, &bundle, None, None);
+    ok(&i);
+    for rel in kept {
+        assert_eq!(
+            fs::read_to_string(fx.dst_app().join(rel)).unwrap(),
+            rel,
+            "{rel}"
+        );
+    }
+    assert!(!fx.dst_app().join(".claude/sessions").exists());
+    assert!(!fx.dst_app().join(&credential).exists());
     let rep = report(&fx, &i);
     assert_eq!(rep["problems"], json!([]), "{rep}");
 }

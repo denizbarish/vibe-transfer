@@ -446,7 +446,10 @@ fn never_class_names_in_project_claude_dir_are_rejected() {
         ".claude/.credentials.json",
         ".claude/.Credentials.json",
         ".claude/sessions/1.json",
-        ".claude/Daemon/x",
+        ".claude/.device-keys.json",
+        ".claude/scheduled_tasks.lock",
+        ".claude/.claude.json.tmp.1",
+        &format!(".claude/.credential{}.json", '\u{17F}'),
     ] {
         let rb = bundle(
             &fx,
@@ -455,5 +458,30 @@ fn never_class_names_in_project_claude_dir_are_rejected() {
         );
         let err = plan(&fx, &rb, &mappings).unwrap_err();
         assert!(format!("{err:#}").contains("reddedildi"), "{rel}: {err:#}");
+    }
+}
+
+#[test]
+fn project_claude_user_content_is_accepted() {
+    let fx = fx();
+    let (id, project, mappings) = app_project(&fx);
+    let root = RootKind::Project(id);
+    for rel in [
+        ".claude/daemon-runbook.md",
+        ".claude/Daemon/x",
+        ".claude/bun.lock",
+        ".claude/debug/notes.md",
+        ".claude/downloads/a.md",
+        ".claude/chrome/a.md",
+        ".claude/tasks/t/.lock",
+        ".claude/agents/ağ-uzmanı.md",
+    ] {
+        let rb = bundle(
+            &fx,
+            vec![file(&fx, 0, root.clone(), rel, b"x")],
+            vec![project.clone()],
+        );
+        let p = plan(&fx, &rb, &mappings).unwrap_or_else(|e| panic!("{rel}: {e:#}"));
+        assert_eq!(p.plan.placements.len(), 1, "{rel}");
     }
 }

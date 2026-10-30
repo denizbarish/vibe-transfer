@@ -29,6 +29,7 @@ pub(crate) const UNREADABLE: &str = "okunamadı";
 const WORKTREES_DENIED: &str = "proje .claude/worktrees klasörü kod içerir, taşınmaz";
 const SECRET_DENIED: &str = "dosya olarak asla taşınmaz: sır";
 const NEVER_DENIED: &str = "asla taşınmaz: makineye özgü";
+const VARIANT_DENIED: &str = "büyük/küçük harf veya Unicode varyantı, .claude ile çakışır";
 
 /// Projects found plus what could not be used, keyed like `Inventory`.
 pub(crate) struct ProjectScan {
@@ -279,23 +280,47 @@ pub fn project_inner_files(project_root: &Path) -> Vec<String> {
     }
 }
 
+/// Never-transferred names directly under a project's `.claude`, folded:
+/// secrets and Claude's own session and machine state. Narrower than the
+/// Claude dir's never list on purpose: in a project, names like `debug/`,
+/// `downloads/`, `daemon-*.md` or `bun.lock` are user content.
+fn is_project_never(first: &str) -> bool {
+    matches!(
+        first,
+        ".credentials.json"
+            | ".device-keys.json"
+            | "sessions"
+            | "session-env"
+            | "shell-snapshots"
+            | "telemetry"
+            | "ide"
+            | "jobs"
+            | ".last-cleanup"
+            | ".claude.json.backup"
+            | "scheduled_tasks.lock"
+    ) || first.starts_with(".claude.json.tmp.")
+}
+
 /// Why a path under a project's `.claude` folder is never transferred, if
 /// it is not. `rest` is the path below `.claude` (empty for the folder).
 /// Shared by export (`scan_project`) and import (`is_project_entry_shape`)
-/// so both sides agree: `.claude/worktrees` (code), and names the Claude
-/// dir classifier marks as never transferred (e.g. `.credentials.json`).
+/// so both sides agree: `.claude/worktrees` (code), secrets such as
+/// `.credentials.json` and Claude's session and machine state.
 pub(crate) fn dot_claude_denial(rest: &str) -> Option<&'static str> {
     if rest.is_empty() {
         return None;
     }
-    let first = rest.split('/').next().unwrap_or_default();
-    if fold(first) == "worktrees" {
+    let first = fold(rest.split('/').next().unwrap_or_default());
+    if first == "worktrees" {
         return Some(WORKTREES_DENIED);
+    }
+    if !is_project_never(&first) {
+        return None;
     }
     match crate::inventory::classify_folded(rest) {
         Some((Class::Never, Category::Secrets)) => Some(SECRET_DENIED),
         Some((Class::Never, _)) => Some(NEVER_DENIED),
-        _ => None,
+        _ => Some(NEVER_DENIED),
     }
 }
 
@@ -357,8 +382,15 @@ pub(crate) fn is_project_entry_shape(rel: &str, kind: &EntryKind) -> bool {
 }
 
 /// NFC and lowercase: how a case-insensitive file system compares names.
+/// `to_lowercase` is not full case folding: U+017F LATIN SMALL LETTER LONG
+/// S stays as is, though it folds to `s`, so `.credentialſ.json` would slip
+/// past the deny names. It is mapped to `s` here. U+212A KELVIN SIGN already
+/// becomes `k` (NFC). Other non-ASCII letters (e.g. Turkish names) are kept.
 pub(crate) fn fold(name: &str) -> String {
-    name.nfc().collect::<String>().to_lowercase()
+    name.nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .replace('\u{17F}', "s")
 }
 
 /// How [`scan_project`] walks one project.
@@ -389,7 +421,15 @@ pub(crate) fn scan_project(
         }
         match dot_claude(parts[0]) {
             DotClaude::Exact => {}
-            DotClaude::Variant => return true,
+            DotClaude::Variant => {
+                // Skipped, but reported: it would land in `.claude` on a
+                // case-insensitive target.
+                unreadable.borrow_mut().push((
+                    rel.to_owned(),
+                    format!("{VARIANT_DENIED} ({})", path.display()),
+                ));
+                return true;
+            }
             DotClaude::Other => {}
         }
         if parts[0] == ".claude" {

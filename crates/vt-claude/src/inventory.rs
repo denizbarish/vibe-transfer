@@ -466,7 +466,8 @@ impl Collector<'_> {
         // `.claude` is a stale one, not project data.
         let stale = env.claude_config_dir_override.is_some()
             && same_path(root, &env.home)
-            && fs::symlink_metadata(root.join(".claude")).is_ok();
+            && fs::symlink_metadata(root.join(".claude")).is_ok()
+            && !same_path(&root.join(".claude"), claude_dir);
         if stale {
             self.skip(
                 &root_kind,
