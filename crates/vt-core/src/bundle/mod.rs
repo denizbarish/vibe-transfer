@@ -23,6 +23,8 @@ mod passphrase;
 mod reader;
 mod writer;
 
+/// Passphrase types, re-exported so callers need no direct `age` dependency.
+pub use age::secrecy::{ExposeSecret, SecretString};
 pub use passphrase::generate_passphrase;
 pub use reader::read_bundle;
 pub use writer::BundleWriter;

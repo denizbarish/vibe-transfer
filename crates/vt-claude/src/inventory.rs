@@ -162,11 +162,7 @@ fn is_never(parts: &[&str]) -> bool {
 }
 
 fn selected(sel: &Selection, category: Category) -> bool {
-    sel.tools.contains(&Tool::Claude)
-        && sel
-            .categories
-            .get(&Tool::Claude)
-            .is_some_and(|c| c.contains(&category))
+    sel.includes(Tool::Claude, category)
 }
 
 /// What happens to one scanned path.
@@ -283,7 +279,9 @@ struct Collector<'a> {
     notes: Vec<(String, String)>,
 }
 
-fn key(root: &RootKind, rel: &str) -> String {
+/// Report key of an item, as used in [`Inventory::skipped`] and
+/// [`Inventory::notes`].
+pub fn item_key(root: &RootKind, rel: &str) -> String {
     match (root, rel) {
         (RootKind::ClaudeDir, _) => rel.to_owned(),
         (_, "") => root.tag(),
@@ -293,7 +291,7 @@ fn key(root: &RootKind, rel: &str) -> String {
 
 impl Collector<'_> {
     fn skip(&mut self, root: &RootKind, rel: &str, reason: impl Into<String>) {
-        self.skipped.push((key(root, rel), reason.into()));
+        self.skipped.push((item_key(root, rel), reason.into()));
     }
 
     /// Scans `base` and adds what `decide` includes. Excluded subtrees are
@@ -343,7 +341,7 @@ impl Collector<'_> {
             match decision {
                 Decision::Include(category, note) => {
                     if let Some(note) = note {
-                        self.notes.push((key(root, &raw.rel), note.into()));
+                        self.notes.push((item_key(root, &raw.rel), note.into()));
                     }
                     included.push((raw, category));
                 }
@@ -491,7 +489,9 @@ fn scan_skip_reason(reason: &str) -> String {
     match reason {
         NON_UTF8_NAME => "UTF-8 olmayan dosya adı, aktarılamaz".into(),
         NON_UTF8_TARGET => "UTF-8 olmayan symlink hedefi, aktarılamaz".into(),
-        other => format!("{SPECIAL}: {other}"),
+        "socket" | "fifo" | "device" | "other" => format!("{SPECIAL}: {reason}"),
+        // VANISHED and UNREADABLE_DIR reasons are already report text.
+        other => other.to_owned(),
     }
 }
 

@@ -9,8 +9,11 @@ pub mod merkle;
 pub mod pathcodec;
 pub mod pathmap;
 pub mod pending;
+pub mod procs;
 pub mod remote;
 pub mod scan;
 pub mod secret_types;
+pub mod selection;
+pub mod session;
 
 pub use env::VtEnv;

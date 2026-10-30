@@ -11,7 +11,7 @@ mod transform;
 use vt_core::VtEnv;
 
 pub use claude_json::read_claude_json_stable;
-pub use inventory::{Inventory, classify};
+pub use inventory::{Inventory, classify, item_key};
 pub use merge::{merge_claude_json, merge_memory_md};
 pub use projects::project_inner_files;
 pub use transform::{

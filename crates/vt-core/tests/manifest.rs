@@ -152,6 +152,80 @@ fn scan_skips_non_utf8_name_and_continues() {
     );
 }
 
+#[test]
+fn scan_records_entries_deleted_mid_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("keep.txt"), b"k").unwrap();
+    fs::write(root.join("gone.txt"), b"g").unwrap();
+    fs::create_dir(root.join("gone-dir")).unwrap();
+    fs::write(root.join("gone-dir/inner.txt"), b"i").unwrap();
+    fs::write(root.join("trigger"), b"t").unwrap();
+
+    // `exclude` runs before each entry is described, so deleting there
+    // stands in for Claude removing a file while the walk is running.
+    // `gone-dir` is removed when `trigger` is seen: whether it was already
+    // described or not, it vanishes before its contents are listed.
+    let scan = scan_tree(root, &|rel: &str| {
+        match rel {
+            "gone.txt" => fs::remove_file(root.join(rel)).unwrap(),
+            "trigger" => fs::remove_dir_all(root.join("gone-dir")).unwrap(),
+            _ => {}
+        }
+        false
+    })
+    .unwrap();
+    let rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+    assert_eq!(rels, vec!["keep.txt", "trigger"]);
+    let skipped: Vec<(&str, &str)> = scan
+        .skipped
+        .iter()
+        .map(|s| (s.rel.as_str(), s.reason.as_str()))
+        .collect();
+    assert_eq!(
+        skipped,
+        vec![
+            ("gone-dir", vt_core::scan::VANISHED),
+            ("gone.txt", vt_core::scan::VANISHED),
+        ]
+    );
+    assert_eq!(vt_core::scan::VANISHED, "tarama sırasında silindi");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_records_unreadable_subdir_and_continues() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("locked")).unwrap();
+    fs::write(root.join("locked/inner.txt"), b"x").unwrap();
+    fs::write(root.join("ok.txt"), b"o").unwrap();
+    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let scan = scan_tree(root, &|_: &str| false);
+    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+    let scan = scan.unwrap();
+
+    let rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+    assert_eq!(rels, vec!["ok.txt"]);
+    assert_eq!(scan.skipped.len(), 1, "{:?}", scan.skipped);
+    assert_eq!(scan.skipped[0].rel, "locked");
+    assert!(
+        scan.skipped[0]
+            .reason
+            .starts_with(vt_core::scan::UNREADABLE_DIR),
+        "{:?}",
+        scan.skipped[0]
+    );
+}
+
+#[test]
+fn scan_fails_only_when_root_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(scan_tree(&dir.path().join("missing"), &|_: &str| false).is_err());
+}
+
 fn entry(index: u32, root: RootKind, rel: &str, hash: [u8; 32]) -> Entry {
     Entry {
         index,

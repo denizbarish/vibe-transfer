@@ -18,12 +18,14 @@ pub struct RawEntry {
     pub mode: u32,
 }
 
-/// A special file that cannot be transferred and was left out of a scan.
+/// An entry left out of a scan: a special file that cannot be transferred,
+/// or one that vanished or could not be read during the walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedEntry {
     pub rel: String,
-    /// `socket`, `fifo`, `device`, `other`, [`NON_UTF8_TARGET`], or
-    /// [`NON_UTF8_NAME`] (then `rel` holds the lossy name).
+    /// `socket`, `fifo`, `device`, `other`, [`NON_UTF8_TARGET`],
+    /// [`NON_UTF8_NAME`] (then `rel` holds the lossy name), [`VANISHED`], or
+    /// [`UNREADABLE_DIR`] followed by `: ` and the error.
     pub reason: String,
 }
 
@@ -31,6 +33,12 @@ pub struct SkippedEntry {
 pub const NON_UTF8_NAME: &str = "utf8-olmayan-ad";
 /// `SkippedEntry::reason` for a symlink whose target is not valid UTF-8.
 pub const NON_UTF8_TARGET: &str = "utf8-olmayan-hedef";
+
+/// `SkippedEntry::reason` for an entry that disappeared during the walk.
+pub const VANISHED: &str = "tarama sırasında silindi";
+/// Prefix of `SkippedEntry::reason` for an entry that could not be read;
+/// the I/O error follows after `: `.
+pub const UNREADABLE_DIR: &str = "okunamadı";
 
 /// Result of [`scan_tree`]: transferable entries plus skipped special files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,17 +54,45 @@ pub struct ScanResult {
 /// skipped with its whole subtree. Symlinks are reported with their target.
 /// Sockets, FIFOs and device files are not transferable: they are listed in
 /// `skipped` so callers can report them, as are non-UTF-8 names (never
-/// descended into). Errors mean an I/O failure, e.g. an unreadable dir.
+/// descended into).
+///
+/// The tree may change while it is walked (Claude deletes and rotates files
+/// as it runs): an entry that disappears is skipped with [`VANISHED`], and a
+/// subdirectory or entry that cannot be read is skipped with a reason that
+/// starts with [`UNREADABLE_DIR`]; a skipped directory is left out with its
+/// whole subtree. Only a failure to read `root` itself is an error.
 /// `mode` holds only the permission bits (`& 0o7777`).
 pub fn scan_tree(root: &Path, exclude: &dyn Fn(&str) -> bool) -> Result<ScanResult> {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
-    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    // A directory's own entry is kept only once its listing succeeds.
+    let mut stack: Vec<(PathBuf, String, Option<RawEntry>)> =
+        vec![(root.to_path_buf(), String::new(), None)];
 
-    while let Some((dir, prefix)) = stack.pop() {
-        let read = fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
+    while let Some((dir, prefix, own)) = stack.pop() {
+        let read = match (fs::read_dir(&dir), own) {
+            (Ok(read), own) => {
+                out.extend(own);
+                read
+            }
+            (Err(e), None) => {
+                return Err(e).with_context(|| format!("read_dir {}", dir.display()));
+            }
+            (Err(e), Some(_)) => {
+                skipped.push(skip_for_io(prefix, &e));
+                continue;
+            }
+        };
         for item in read {
-            let item = item.with_context(|| format!("read_dir {}", dir.display()))?;
+            let item = match item {
+                Ok(item) => item,
+                Err(e) => {
+                    // The listing broke off; what was read so far is kept.
+                    // An empty `rel` means the root.
+                    skipped.push(skip_for_io(prefix.clone(), &e));
+                    break;
+                }
+            };
             let path = item.path();
             let join = |name: &str| {
                 if prefix.is_empty() {
@@ -82,14 +118,19 @@ pub fn scan_tree(root: &Path, exclude: &dyn Fn(&str) -> bool) -> Result<ScanResu
                 continue;
             }
 
-            match stat_entry(&path, rel)? {
-                Ok(raw) => {
-                    if raw.kind == EntryKind::Dir {
-                        stack.push((path, raw.rel.clone()));
-                    }
-                    out.push(raw);
+            match stat_entry(&path, rel.clone()) {
+                Ok(Ok(raw)) if raw.kind == EntryKind::Dir => {
+                    stack.push((path, raw.rel.clone(), Some(raw)));
                 }
-                Err(skip) => skipped.push(skip),
+                Ok(Ok(raw)) => out.push(raw),
+                Ok(Err(skip)) => skipped.push(skip),
+                Err(e) => match e.root_cause().downcast_ref::<std::io::Error>() {
+                    Some(io) => skipped.push(skip_for_io(rel, io)),
+                    None => skipped.push(SkippedEntry {
+                        rel,
+                        reason: format!("{UNREADABLE_DIR}: {e:#}"),
+                    }),
+                },
             }
         }
     }
@@ -100,6 +141,16 @@ pub fn scan_tree(root: &Path, exclude: &dyn Fn(&str) -> bool) -> Result<ScanResu
         entries: out,
         skipped,
     })
+}
+
+/// Skip record for an I/O failure on `rel` found during the walk.
+fn skip_for_io(rel: String, e: &std::io::Error) -> SkippedEntry {
+    let reason = if e.kind() == std::io::ErrorKind::NotFound {
+        VANISHED.to_owned()
+    } else {
+        format!("{UNREADABLE_DIR}: {e}")
+    };
+    SkippedEntry { rel, reason }
 }
 
 /// Describes one path as `rel`, without following a symlink. Special files
