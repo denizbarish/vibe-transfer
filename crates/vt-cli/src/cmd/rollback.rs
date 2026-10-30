@@ -12,8 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use vt_core::apply::{self, RollbackReport, validate_session};
 use vt_core::bundle::{SecretString, decrypt_file};
-use vt_core::fsutil::create_private_file;
-use vt_core::report::{SecretWrite, VerifyReport, hash_bytes};
+use vt_core::fsutil::{create_private_dir_all, create_private_file};
+use vt_core::report::{SecretWrite, VerifyReport, hash_bytes, read_secret_write};
 use vt_core::secret_types::SecretBytes;
 
 use super::link::ARCHIVE_DIR;
@@ -109,10 +109,9 @@ pub fn run(ctx: &Ctx, args: &RollbackArgs) -> Result<()> {
         SecretStep::Pending(reason) => {
             eprintln!("UYARI: sır adımı geri alınmadı, bekliyor: {}", c(reason));
             eprintln!(
-                "Dosyalar geri alındı. Sır adımını tamamlamak için paket parolasıyla çalıştırın:"
+                "Dosyalar geri alındı. Sır adımını tamamlamak için bir terminalde yeniden çalıştırın; onay ve paket parolası sorulur:"
             );
             eprintln!("    vibe-transfer rollback {session}");
-            eprintln!("    (terminal yoksa: vibe-transfer rollback {session} --passphrase-stdin)");
             bail!("sır adımı bekliyor: {reason}");
         }
     }
@@ -133,17 +132,13 @@ fn undo_secret(
     session: &str,
     backups: &Path,
 ) -> Result<SecretStep> {
-    let report_path = ctx
-        .env
-        .vt_home
-        .join("reports")
-        .join(format!("{session}.json"));
-    let Ok(bytes) = fs::read(&report_path) else {
-        return Ok(SecretStep::Nothing);
+    // The dedicated record is written before the store changes; older
+    // imports only have it in the report.
+    let recorded = match read_secret_write(&ctx.env.vt_home, session)? {
+        Some(w) => Some(w),
+        None => report_secret_write(&ctx.env.vt_home, session)?,
     };
-    let report: VerifyReport = serde_json::from_slice(&bytes)
-        .with_context(|| format!("rapor bozuk: {}", report_path.display()))?;
-    let Some(w) = report.secret_write else {
+    let Some(w) = recorded else {
         return Ok(SecretStep::Nothing);
     };
     let marker = backups.join(SECRET_DONE);
@@ -155,10 +150,14 @@ fn undo_secret(
     let changed = current.as_ref().map(|v| hash_bytes(v.expose())) != Some(w.written);
     drop(current);
     let restored = if w.had_previous {
-        let Some(pass) = passphrase(args)? else {
-            return Ok(SecretStep::Pending(
-                "önceki değeri geri koymak için paket parolası gerekiyor; terminal yok".into(),
-            ));
+        let pass = match passphrase(args) {
+            Ok(Some(pass)) => pass,
+            Ok(None) => {
+                return Ok(SecretStep::Pending(
+                    "önceki değeri geri koymak için paket parolası gerekiyor; terminal yok".into(),
+                ));
+            }
+            Err(e) => return Ok(SecretStep::Pending(format!("parola alınamadı: {e:#}"))),
         };
         let previous = match previous_value(&backups.join("secrets.age"), &pass, &w) {
             Ok(v) => v,
@@ -177,9 +176,23 @@ fn undo_secret(
         }
         false
     };
+    create_private_dir_all(backups)
+        .with_context(|| format!("oluşturulamadı: {}", backups.display()))?;
     create_private_file(&marker)
         .with_context(|| format!("oluşturulamadı: {}", marker.display()))?;
     Ok(SecretStep::Done { restored, changed })
+}
+
+/// `secret_write` of the session's report, for imports made before the
+/// dedicated record existed.
+fn report_secret_write(vt_home: &Path, session: &str) -> Result<Option<SecretWrite>> {
+    let path = vt_home.join("reports").join(format!("{session}.json"));
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(None);
+    };
+    let report: VerifyReport = serde_json::from_slice(&bytes)
+        .with_context(|| format!("rapor bozuk: {}", path.display()))?;
+    Ok(report.secret_write)
 }
 
 /// The bundle passphrase: from stdin with `--passphrase-stdin`, typed on a

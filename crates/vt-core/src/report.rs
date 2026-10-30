@@ -212,6 +212,49 @@ pub fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
     bytes
 }
 
+/// Where an import records its secret store write before making it.
+fn secret_write_path(vt_home: &Path, session: &str) -> PathBuf {
+    vt_home
+        .join("backups")
+        .join(session)
+        .join("secret-write.json")
+}
+
+/// Persists `w` for `rollback` (dirs 0700, file 0600, written through a
+/// temp file and a rename), before the store is changed, so a failure
+/// later in the import still leaves the record behind.
+pub fn write_secret_write(vt_home: &Path, session: &str, w: &SecretWrite) -> Result<()> {
+    crate::apply::validate_session(session)?;
+    let path = secret_write_path(vt_home, session);
+    let dir = path.parent().context("kayıt yolunun klasörü yok")?;
+    create_private_dir_all(dir).with_context(|| format!("oluşturulamadı: {}", dir.display()))?;
+    let tmp = dir.join("secret-write.json.tmp");
+    let _ = fs::remove_file(&tmp);
+    let result = (|| -> Result<()> {
+        let mut file = create_private_file(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(w)?)?;
+        file.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("sır kaydı yazılamadı: {}", path.display()))
+}
+
+/// The secret write recorded by `write_secret_write`, if any.
+pub fn read_secret_write(vt_home: &Path, session: &str) -> Result<Option<SecretWrite>> {
+    let path = secret_write_path(vt_home, session);
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("sır kaydı bozuk: {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("okunamadı: {}", path.display())),
+    }
+}
+
 /// Writes `report` to `<vt_home>/reports/<session>.json` (dirs 0700, file
 /// 0600) and returns the path.
 pub fn write_report(vt_home: &Path, report: &VerifyReport) -> Result<PathBuf> {

@@ -751,3 +751,71 @@ fn logout_source_refuses_another_account() {
             .exists()
     );
 }
+
+fn store_with(token: &str) -> Value {
+    json!([{"service": SERVICE, "account": "dst", "value": token}])
+}
+
+#[test]
+fn rollback_on_an_empty_target_removes_the_secret_once() {
+    let fx = setup();
+    let (bundle, _) = export(&fx);
+    // Nothing on the target is overwritten and there is no previous secret.
+    fs::remove_dir_all(fx.dst.join("code")).unwrap();
+    let session = import(&fx, &bundle, None);
+    let yes = Some(json!({"rollback": true}));
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback", &session],
+        yes.clone(),
+        store_with(&fake_token()),
+        "",
+    );
+    ok(&out);
+    assert_eq!(dst_digest(&secrets), None, "{secrets:?}");
+    let shown = text(&out.stdout);
+    assert!(shown.contains("Geri alındı"), "{shown}");
+    assert!(shown.contains("sır deposundan kaldırıldı"), "{shown}");
+
+    // Logged in again since: a second rollback leaves the store alone.
+    let fresh = format!("{}-relogin", fake_token());
+    let (out, secrets) = dst_store(&fx, &["rollback", &session], yes, store_with(&fresh), "");
+    ok(&out);
+    assert_eq!(dst_digest(&secrets), Some(digest(&fresh)));
+}
+
+#[test]
+fn rollback_undoes_the_secret_of_an_import_that_failed_after_writing_it() {
+    let fx = setup();
+    let (bundle, _) = export(&fx);
+    // The report cannot be written: the import fails after the store write.
+    write(&fx.dst_vt().join("reports"), "not a folder\n");
+    let output = run(
+        &fx.dst,
+        "dst",
+        &[
+            "import",
+            bundle.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--json",
+        ],
+        &[],
+        None,
+        &format!("{PASS}\n"),
+    );
+    assert!(!output.status.success());
+    let session = fs::read_dir(fx.dst_vt().join("journal"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .find_map(|n| n.strip_suffix(".jsonl").map(str::to_owned))
+        .unwrap();
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback", &session],
+        Some(json!({"rollback": true})),
+        store_with(&fake_token()),
+        "",
+    );
+    ok(&out);
+    assert_eq!(dst_digest(&secrets), None, "{secrets:?}");
+}
