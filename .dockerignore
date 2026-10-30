@@ -6,6 +6,5 @@ docs/research
 **/*.vtb
 **/*.age
 **/.vibe-transfer
-**/.env
-**/.env.*
+**/.env*
 **/.DS_Store

@@ -101,7 +101,7 @@ impl Drop for CleanupGuard<'_> {
 #[ignore = "touches the real Keychain; set VT_KEYCHAIN_TEST=1 and pass --ignored"]
 fn keyring_store_round_trip() {
     if std::env::var("VT_KEYCHAIN_TEST").as_deref() != Ok("1") {
-        eprintln!("VT_KEYCHAIN_TEST=1 değil, atlandı");
+        eprintln!("SKIPPED: VT_KEYCHAIN_TEST=1 değil");
         return;
     }
     let service = format!("vibe-transfer-test-{}", uuid::Uuid::new_v4());

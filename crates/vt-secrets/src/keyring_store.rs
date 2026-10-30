@@ -265,8 +265,12 @@ pub(crate) mod acl {
         }
 
         #[test]
-        #[ignore = "creates a throwaway keychain file; run manually on macOS"]
+        #[ignore = "creates a throwaway keychain file; set VT_KEYCHAIN_TEST=1 and pass --ignored"]
         fn new_item_is_readable_by_security_tool() {
+            if std::env::var("VT_KEYCHAIN_TEST").as_deref() != Ok("1") {
+                eprintln!("SKIPPED: VT_KEYCHAIN_TEST=1 değil");
+                return;
+            }
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("vt-acl-test.keychain-db");
             let path_str = path.to_str().unwrap();
