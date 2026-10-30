@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Leak check
+        run: scripts/leak-check.sh
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # fmt, clippy and tests run inside the image; only `cargo fetch`
+      # reaches the network.
+      - name: Test container
+        run: docker build -f Dockerfile.test .
+
+  macos:
+    runs-on: macos-latest
+    env:
+      # Runs the ignored Keychain test that uses a throwaway keychain file.
+      # The test that uses the login keychain (vt-secrets/tests/store.rs)
+      # never runs on CI.
+      VT_KEYCHAIN_TEST: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --quiet --locked
+      - name: Keychain test (throwaway keychain)
+        if: env.VT_KEYCHAIN_TEST == '1'
+        run: cargo test -p vt-secrets --lib --locked -- --ignored

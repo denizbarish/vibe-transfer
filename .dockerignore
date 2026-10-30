@@ -1,0 +1,11 @@
+target
+.git
+.github
+.superpowers
+docs/research
+**/*.vtb
+**/*.age
+**/.vibe-transfer
+**/.env
+**/.env.*
+**/.DS_Store
