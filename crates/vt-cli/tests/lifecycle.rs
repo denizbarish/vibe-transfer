@@ -455,14 +455,31 @@ fn rollback_restores_pre_import_state() {
     assert!(!out.status.success());
     assert_ne!(snapshot(&fx.dst, &fx.dst_vt()), before);
 
-    // The imported token has since been refreshed: it is removed anyway,
-    // and the summary says so. No previous value, so no passphrase needed.
+    // The imported token has since been refreshed. Declined: the files are
+    // rolled back, the secret step waits and the store is untouched.
     let refreshed = format!("{}-refreshed", fake_token());
     let (out, secrets) = dst_store(
         &fx,
         &["rollback"],
-        Some(json!({"rollback": true})),
-        json!([{"service": SERVICE, "account": "dst", "value": refreshed}]),
+        Some(json!({"rollback": true, "secret_changed": false})),
+        store_with(&refreshed),
+        "",
+    );
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("sır adımı bekliyor"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(snapshot(&fx.dst, &fx.dst_vt()), before);
+    assert_eq!(dst_digest(&secrets), Some(digest(&refreshed)));
+
+    // Confirmed: removed, and the summary says it had changed.
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback"],
+        Some(json!({"rollback": true, "secret_changed": true})),
+        store_with(&refreshed),
         "",
     );
     ok(&out);
@@ -763,6 +780,10 @@ fn rollback_on_an_empty_target_removes_the_secret_once() {
     // Nothing on the target is overwritten and there is no previous secret.
     fs::remove_dir_all(fx.dst.join("code")).unwrap();
     let session = import(&fx, &bundle, None);
+    // As an import from before the dedicated record: only the report has
+    // it, and the session has no backup folder, so rollback creates it.
+    let backups = fx.dst_vt().join("backups").join(&session);
+    fs::remove_dir_all(&backups).unwrap();
     let yes = Some(json!({"rollback": true}));
     let (out, secrets) = dst_store(
         &fx,
@@ -818,4 +839,113 @@ fn rollback_undoes_the_secret_of_an_import_that_failed_after_writing_it() {
     );
     ok(&out);
     assert_eq!(dst_digest(&secrets), None, "{secrets:?}");
+}
+
+/// Imports with every secret store `set` failing; returns the session.
+fn import_failing_set(fx: &Fx, bundle: &Path, target_secrets: Option<Value>) -> String {
+    let file = fx.tmp.path().join("dst-secrets.json");
+    let mut envs: Vec<(&str, &Path)> = vec![("VT_TEST_FAIL_SECRET_SET", Path::new("1"))];
+    if let Some(items) = target_secrets {
+        fs::write(&file, items.to_string()).unwrap();
+        envs.push(("VT_TEST_SECRETS", &file));
+    }
+    let out = run(
+        &fx.dst,
+        "dst",
+        &[
+            "import",
+            bundle.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--json",
+        ],
+        &envs,
+        None,
+        &format!("{PASS}\n"),
+    );
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stdout).contains("sır yazılamadı"),
+        "{}",
+        text(&out.stdout)
+    );
+    json_out(&out)["session_id"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn rollback_leaves_a_secret_the_import_never_wrote() {
+    let fx = setup();
+    let (bundle, _) = export(&fx);
+    let session = import_failing_set(&fx, &bundle, None);
+    // The user then logged in by hand.
+    let manual = format!("{}-manual", fake_token());
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback", &session],
+        Some(json!({"rollback": true})),
+        store_with(&manual),
+        "",
+    );
+    ok(&out);
+    assert_eq!(dst_digest(&secrets), Some(digest(&manual)));
+    assert!(
+        text(&out.stdout).contains("dokunulmadı"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn rollback_after_a_failed_replace_restores_only_a_missing_value() {
+    let previous = format!("{}-target", fake_token());
+    let newer = format!("{}-newer", fake_token());
+    for (now, want) in [
+        (json!([]), Some(&previous)),
+        (store_with(&newer), Some(&newer)),
+    ] {
+        let fx = setup();
+        let (bundle, _) = export(&fx);
+        let session = import_failing_set(&fx, &bundle, Some(store_with(&previous)));
+        let (out, secrets) = dst_store(
+            &fx,
+            &["rollback", &session, "--passphrase-stdin"],
+            Some(json!({"rollback": true})),
+            now,
+            &format!("{PASS}\n"),
+        );
+        ok(&out);
+        assert_eq!(dst_digest(&secrets), want.map(|v| digest(v)));
+    }
+}
+
+#[test]
+fn corrupt_secret_record_leaves_the_secret_step_pending() {
+    let fx = setup();
+    let (bundle, _) = export(&fx);
+    let session = import(&fx, &bundle, None);
+    let record = fx
+        .dst_vt()
+        .join("backups")
+        .join(&session)
+        .join("secret-write.json");
+    fs::write(&record, "{ not json").unwrap();
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback", &session],
+        Some(json!({"rollback": true})),
+        store_with(&fake_token()),
+        "",
+    );
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stdout).contains("Geri alındı"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(
+        text(&out.stderr).contains("sır adımı bekliyor"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(dst_digest(&secrets), Some(digest(&fake_token())));
+    assert!(!fx.dst_app().join("CLAUDE.md").exists());
 }

@@ -66,6 +66,10 @@ pub struct SecretWrite {
     /// BLAKE3 of the value written.
     #[serde(with = "hex32")]
     pub written: [u8; 32],
+    /// `false` until the store holds `written` (set and read back). Records
+    /// without the field count as not committed.
+    #[serde(default)]
+    pub committed: bool,
 }
 
 /// One verified target object.
@@ -221,8 +225,9 @@ fn secret_write_path(vt_home: &Path, session: &str) -> PathBuf {
 }
 
 /// Persists `w` for `rollback` (dirs 0700, file 0600, written through a
-/// temp file and a rename), before the store is changed, so a failure
-/// later in the import still leaves the record behind.
+/// temp file and a synced rename). The import writes it twice: not
+/// committed before the store changes, committed once the store holds the
+/// value, so a failure anywhere still leaves a record that says which.
 pub fn write_secret_write(vt_home: &Path, session: &str, w: &SecretWrite) -> Result<()> {
     crate::apply::validate_session(session)?;
     let path = secret_write_path(vt_home, session);
@@ -235,6 +240,8 @@ pub fn write_secret_write(vt_home: &Path, session: &str, w: &SecretWrite) -> Res
         file.write_all(&serde_json::to_vec_pretty(w)?)?;
         file.sync_all()?;
         fs::rename(&tmp, &path)?;
+        // Persist the rename itself.
+        fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {

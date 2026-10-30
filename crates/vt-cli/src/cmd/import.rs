@@ -432,19 +432,26 @@ fn import_secret(
     if let Some(prev) = &previous {
         backup_secret(&ctx.env.vt_home, session, pass, &service, &account, prev)?;
     }
-    // Recorded on disk before the store changes: rollback finds it even
-    // when the import fails later (or the set itself fails halfway).
-    let write = SecretWrite {
+    // Two-phase record: written as not committed before the store
+    // changes, then committed once the value is read back. Rollback finds
+    // it even when the import fails later, and knows whether the write
+    // happened.
+    let mut write = SecretWrite {
         service: service.clone(),
         account: account.clone(),
         had_previous: previous.is_some(),
         written: hash_bytes(new_value.expose()),
+        committed: false,
     };
     write_secret_write(&ctx.env.vt_home, session, &write)?;
     ctx.store.set(&service, &account, &new_value)?;
-    report.secret_write = Some(write);
     match ctx.store.get(&service, &account)? {
-        Some(v) if v.expose() == new_value.expose() => report.verified += 1,
+        Some(v) if v.expose() == new_value.expose() => {
+            write.committed = true;
+            write_secret_write(&ctx.env.vt_home, session, &write)?;
+            report.secret_write = Some(write);
+            report.verified += 1;
+        }
         _ => report
             .problems
             .push(format!("sır deposunda beklenen değer yok: {service}")),

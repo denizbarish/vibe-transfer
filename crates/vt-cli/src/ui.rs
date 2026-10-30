@@ -204,6 +204,8 @@ pub struct Answers {
     pub rollback: Option<bool>,
     /// Whether to remove the listed pending orphans.
     pub orphans: Option<bool>,
+    /// Whether rollback may undo a secret that changed since the import.
+    pub secret_changed: Option<bool>,
     /// PIDs to treat as a running Claude (the real process list belongs to
     /// the real machine, not the synthetic home).
     #[serde(default)]
@@ -488,6 +490,24 @@ impl Prompter<'_> {
                 .interact()
                 .context("onay alınamadı"),
             None => Err(no_terminal(&question)),
+        }
+    }
+
+    /// Whether rollback may restore or remove the secret of `service` that
+    /// changed since the import; `None` when nobody can be asked.
+    pub fn confirm_secret_change(&mut self, service: &str) -> Result<Option<bool>> {
+        match self.answers {
+            Some(a) => Ok(a.secret_changed),
+            None if interactive() => Confirm::new()
+                .with_prompt(format!(
+                    "{} kaydı içe aktarmadan sonra değişmiş (ör. token yenilendi). Yine de geri alınsın mı?",
+                    clean(service)
+                ))
+                .default(false)
+                .interact()
+                .map(Some)
+                .context("onay alınamadı"),
+            None => Ok(None),
         }
     }
 

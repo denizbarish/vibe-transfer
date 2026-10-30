@@ -40,6 +40,9 @@ const TEST_ANSWERS_VAR: &str = "VT_TEST_ANSWERS";
 /// Test hook: file that receives `[{"service", "account", "blake3"}]` of the
 /// in-memory store when the command ends: digests only, never values.
 const TEST_SECRETS_DUMP_VAR: &str = "VT_TEST_SECRETS_DUMP";
+/// Test hook: any non-empty value makes every `set` on the in-memory
+/// store fail. Only valid together with [`TEST_HOME_VAR`].
+const TEST_FAIL_SET_VAR: &str = "VT_TEST_FAIL_SECRET_SET";
 
 /// What every command runs against.
 pub struct Ctx {
@@ -53,14 +56,18 @@ pub struct Ctx {
     test_store: Option<Arc<MemStore>>,
 }
 
-/// Shares the test `MemStore` between `Ctx::store` and the dump.
-struct SharedMem(Arc<MemStore>);
+/// Shares the test `MemStore` between `Ctx::store` and the dump; the flag
+/// makes `set` fail (`VT_TEST_FAIL_SECRET_SET`).
+struct SharedMem(Arc<MemStore>, bool);
 
 impl SecretStore for SharedMem {
     fn get(&self, service: &str, account: &str) -> Result<Option<SecretBytes>> {
         self.0.get(service, account)
     }
     fn set(&self, service: &str, account: &str, value: &SecretBytes) -> Result<()> {
+        if self.1 {
+            bail!("test: sır deposuna yazma hatası");
+        }
         self.0.set(service, account, value)
     }
     fn delete(&self, service: &str, account: &str) -> Result<()> {
@@ -89,6 +96,10 @@ impl Ctx {
                 (
                     TEST_SECRETS_DUMP_VAR,
                     std::env::var_os(TEST_SECRETS_DUMP_VAR).is_some(),
+                ),
+                (
+                    TEST_FAIL_SET_VAR,
+                    std::env::var_os(TEST_FAIL_SET_VAR).is_some(),
                 ),
             ] {
                 if set {
@@ -130,7 +141,10 @@ impl Ctx {
         let answers = test_answers.as_deref().map(Answers::parse).transpose()?;
         Ok(Self {
             env: VtEnv::new(home, user, None),
-            store: Box::new(SharedMem(Arc::clone(&store))),
+            store: Box::new(SharedMem(
+                Arc::clone(&store),
+                std::env::var_os(TEST_FAIL_SET_VAR).is_some_and(|v| !v.is_empty()),
+            )),
             test_mode: true,
             answers,
             test_store: Some(store),

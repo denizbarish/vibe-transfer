@@ -35,7 +35,10 @@ enum SecretStep {
         /// The value had changed since the import (e.g. a refreshed token).
         changed: bool,
     },
-    /// Not undone; why.
+    /// Left as it is on purpose (the import's write never happened, or
+    /// something newer is there); why. The step is closed.
+    Untouched(String),
+    /// Not undone; why. The store is untouched and a rerun can finish it.
     Pending(String),
 }
 
@@ -106,10 +109,13 @@ pub fn run(ctx: &Ctx, args: &RollbackArgs) -> Result<()> {
                 );
             }
         }
+        SecretStep::Untouched(reason) => {
+            println!("Sır deposuna dokunulmadı: {}", c(reason));
+        }
         SecretStep::Pending(reason) => {
             eprintln!("UYARI: sır adımı geri alınmadı, bekliyor: {}", c(reason));
             eprintln!(
-                "Dosyalar geri alındı. Sır adımını tamamlamak için bir terminalde yeniden çalıştırın; onay ve paket parolası sorulur:"
+                "Dosyalar geri alındı. Sır adımını tamamlamak için bir terminalde yeniden çalıştırın; gereken onay ve paket parolası sorulur:"
             );
             eprintln!("    vibe-transfer rollback {session}");
             bail!("sır adımı bekliyor: {reason}");
@@ -125,62 +131,124 @@ fn add(total: &mut RollbackReport, r: RollbackReport) {
     total.set_aside.extend(r.set_aside);
 }
 
-/// Undoes the secret store write recorded in the session's report, once.
+/// Undoes the import's secret store write, once. Nothing is deleted or
+/// overwritten that the import did not put there, unless the user agrees:
+///
+/// - Not committed (the import's set failed or was not confirmed): a
+///   current value equal to the written one counts as committed. Otherwise,
+///   with no previous value, or with a different current value, the store
+///   is left alone; with a previous value and nothing there now (a replace
+///   that failed halfway), the previous value is restored.
+/// - Committed but changed since (e.g. a refreshed token): only with the
+///   user's confirmation; otherwise pending.
 fn undo_secret(
     ctx: &Ctx,
     args: &RollbackArgs,
     session: &str,
     backups: &Path,
 ) -> Result<SecretStep> {
-    // The dedicated record is written before the store changes; older
-    // imports only have it in the report.
-    let recorded = match read_secret_write(&ctx.env.vt_home, session)? {
-        Some(w) => Some(w),
-        None => report_secret_write(&ctx.env.vt_home, session)?,
-    };
-    let Some(w) = recorded else {
-        return Ok(SecretStep::Nothing);
-    };
     let marker = backups.join(SECRET_DONE);
     if marker.exists() {
         return Ok(SecretStep::Nothing);
     }
-    let current = ctx.store.get(&w.service, &w.account)?;
+    // The dedicated record is written around the store change; older
+    // imports only have it in the report, written after a confirmed set.
+    let recorded = match read_secret_write(&ctx.env.vt_home, session) {
+        Ok(Some(w)) => Some(w),
+        Ok(None) => match report_secret_write(&ctx.env.vt_home, session) {
+            Ok(w) => w.map(|w| SecretWrite {
+                committed: true,
+                ..w
+            }),
+            Err(e) => return Ok(SecretStep::Pending(format!("{e:#}"))),
+        },
+        Err(e) => return Ok(SecretStep::Pending(format!("{e:#}"))),
+    };
+    let Some(w) = recorded else {
+        return Ok(SecretStep::Nothing);
+    };
     // Digests only: values are never compared in a way that could be logged.
-    let changed = current.as_ref().map(|v| hash_bytes(v.expose())) != Some(w.written);
-    drop(current);
-    let restored = if w.had_previous {
-        let pass = match passphrase(args) {
-            Ok(Some(pass)) => pass,
-            Ok(None) => {
+    let current = ctx
+        .store
+        .get(&w.service, &w.account)?
+        .map(|v| hash_bytes(v.expose()));
+    let ours = current == Some(w.written);
+    let step = if w.committed || ours {
+        let changed = !ours;
+        if changed {
+            let mut prompter = Prompter::new(ctx.answers.as_ref());
+            if prompter.confirm_secret_change(&w.service)? != Some(true) {
                 return Ok(SecretStep::Pending(
-                    "önceki değeri geri koymak için paket parolası gerekiyor; terminal yok".into(),
+                    "sır içe aktarmadan sonra değişmiş (ör. token yenilendi); geri almak için onay gerekiyor"
+                        .into(),
                 ));
             }
-            Err(e) => return Ok(SecretStep::Pending(format!("parola alınamadı: {e:#}"))),
-        };
-        let previous = match previous_value(&backups.join("secrets.age"), &pass, &w) {
-            Ok(v) => v,
-            Err(e) => return Ok(SecretStep::Pending(format!("{e:#}"))),
-        };
-        ctx.store.set(&w.service, &w.account, &previous)?;
-        match ctx.store.get(&w.service, &w.account)? {
-            Some(v) if v.expose() == previous.expose() => {}
-            _ => bail!("önceki sır değeri geri konamadı: {}", w.service),
         }
-        true
+        if w.had_previous {
+            if let Err(reason) = restore_previous(ctx, args, &w, backups)? {
+                return Ok(SecretStep::Pending(reason));
+            }
+        } else {
+            ctx.store.delete(&w.service, &w.account)?;
+            if ctx.store.get(&w.service, &w.account)?.is_some() {
+                bail!("içe aktarılan sır kaldırılamadı: {}", w.service);
+            }
+        }
+        SecretStep::Done {
+            restored: w.had_previous,
+            changed,
+        }
+    } else if !w.had_previous {
+        SecretStep::Untouched(
+            "içe aktarma sırrı yazamamıştı; şimdiki değer içe aktarmadan değil".into(),
+        )
+    } else if current.is_none() {
+        // The replace failed halfway: the old value is gone, nothing new.
+        if let Err(reason) = restore_previous(ctx, args, &w, backups)? {
+            return Ok(SecretStep::Pending(reason));
+        }
+        SecretStep::Done {
+            restored: true,
+            changed: false,
+        }
     } else {
-        ctx.store.delete(&w.service, &w.account)?;
-        if ctx.store.get(&w.service, &w.account)?.is_some() {
-            bail!("içe aktarılan sır kaldırılamadı: {}", w.service);
-        }
-        false
+        SecretStep::Untouched(
+            "içe aktarma sırrı yazamamıştı; şimdiki değer daha yeni, korundu".into(),
+        )
     };
     create_private_dir_all(backups)
         .with_context(|| format!("oluşturulamadı: {}", backups.display()))?;
     create_private_file(&marker)
         .with_context(|| format!("oluşturulamadı: {}", marker.display()))?;
-    Ok(SecretStep::Done { restored, changed })
+    Ok(step)
+}
+
+/// Puts the value saved before the import back. `Ok(Err(reason))` when the
+/// passphrase or the backup is not usable: the step stays pending.
+fn restore_previous(
+    ctx: &Ctx,
+    args: &RollbackArgs,
+    w: &SecretWrite,
+    backups: &Path,
+) -> Result<std::result::Result<(), String>> {
+    let pass = match passphrase(args) {
+        Ok(Some(pass)) => pass,
+        Ok(None) => {
+            return Ok(Err(
+                "önceki değeri geri koymak için paket parolası gerekiyor; terminal yok".into(),
+            ));
+        }
+        Err(e) => return Ok(Err(format!("parola alınamadı: {e:#}"))),
+    };
+    let previous = match previous_value(&backups.join("secrets.age"), &pass, w) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(format!("{e:#}"))),
+    };
+    ctx.store.set(&w.service, &w.account, &previous)?;
+    match ctx.store.get(&w.service, &w.account)? {
+        Some(v) if v.expose() == previous.expose() => Ok(Ok(())),
+        _ => bail!("önceki sır değeri geri konamadı: {}", w.service),
+    }
 }
 
 /// `secret_write` of the session's report, for imports made before the
