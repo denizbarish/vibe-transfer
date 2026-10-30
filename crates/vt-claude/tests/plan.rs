@@ -436,3 +436,24 @@ fn home_mapped_project_never_writes_into_the_live_claude_dir() {
     let p = plan(&fx, &rb, &mappings).unwrap();
     assert_eq!(p.plan.placements[0].dest, fx.env.home.join("CLAUDE.md"));
 }
+
+#[test]
+fn never_class_names_in_project_claude_dir_are_rejected() {
+    let fx = fx();
+    let (id, project, mappings) = app_project(&fx);
+    let root = RootKind::Project(id);
+    for rel in [
+        ".claude/.credentials.json",
+        ".claude/.Credentials.json",
+        ".claude/sessions/1.json",
+        ".claude/Daemon/x",
+    ] {
+        let rb = bundle(
+            &fx,
+            vec![file(&fx, 0, root.clone(), rel, b"x")],
+            vec![project.clone()],
+        );
+        let err = plan(&fx, &rb, &mappings).unwrap_err();
+        assert!(format!("{err:#}").contains("reddedildi"), "{rel}: {err:#}");
+    }
+}

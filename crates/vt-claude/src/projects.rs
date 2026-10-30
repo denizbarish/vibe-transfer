@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
-use vt_core::manifest::{EntryKind, ProjectId, ProjectRef};
+use vt_core::manifest::{Category, Class, EntryKind, ProjectId, ProjectRef};
 use vt_core::remote::{normalize_remote, read_origin};
 use vt_core::scan::{ScanResult, scan_tree};
 
@@ -26,6 +26,9 @@ const PRUNED_DIRS: &[&str] = &[".git", "node_modules", "vendor", ".next", "targe
 const ROOT_FILES: &[&str] = &["CLAUDE.md", "CLAUDE.local.md", ".mcp.json"];
 
 pub(crate) const UNREADABLE: &str = "okunamadı";
+const WORKTREES_DENIED: &str = "proje .claude/worktrees klasörü kod içerir, taşınmaz";
+const SECRET_DENIED: &str = "dosya olarak asla taşınmaz: sır";
+const NEVER_DENIED: &str = "asla taşınmaz: makineye özgü";
 
 /// Projects found plus what could not be used, keyed like `Inventory`.
 pub(crate) struct ProjectScan {
@@ -276,29 +279,75 @@ pub fn project_inner_files(project_root: &Path) -> Vec<String> {
     }
 }
 
+/// Why a path under a project's `.claude` folder is never transferred, if
+/// it is not. `rest` is the path below `.claude` (empty for the folder).
+/// Shared by export (`scan_project`) and import (`is_project_entry_shape`)
+/// so both sides agree: `.claude/worktrees` (code), and names the Claude
+/// dir classifier marks as never transferred (e.g. `.credentials.json`).
+pub(crate) fn dot_claude_denial(rest: &str) -> Option<&'static str> {
+    if rest.is_empty() {
+        return None;
+    }
+    let first = rest.split('/').next().unwrap_or_default();
+    if fold(first) == "worktrees" {
+        return Some(WORKTREES_DENIED);
+    }
+    match crate::inventory::classify_folded(rest) {
+        Some((Class::Never, Category::Secrets)) => Some(SECRET_DENIED),
+        Some((Class::Never, _)) => Some(NEVER_DENIED),
+        _ => None,
+    }
+}
+
+/// How the first component of a project path relates to `.claude`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DotClaude {
+    /// Not `.claude` in any spelling.
+    Other,
+    /// Exactly `.claude`.
+    Exact,
+    /// A case or normalization variant (`.Claude`): never transferred, as
+    /// a case-insensitive target would write it into `.claude`.
+    Variant,
+}
+
+pub(crate) fn dot_claude(first: &str) -> DotClaude {
+    if first == ".claude" {
+        DotClaude::Exact
+    } else if fold(first) == ".claude" {
+        DotClaude::Variant
+    } else {
+        DotClaude::Other
+    }
+}
+
+/// A folder never searched for nested `CLAUDE.md` files, in any spelling.
+pub(crate) fn is_pruned_dir(name: &str) -> bool {
+    let name = fold(name);
+    PRUNED_DIRS.iter().any(|p| fold(p) == name)
+}
+
 /// Whether `rel` (an entry of `kind` in a project root) has a shape the
 /// project scan below can produce: `CLAUDE.md`, `CLAUDE.local.md` and
-/// `.mcp.json` at the root, `.claude` and anything under it except
-/// `.claude/worktrees`, `CLAUDE.md` in subfolders up to 3 levels deep, and
-/// the folders leading to such a file. The import uses it to refuse any
-/// other project path a bundle may carry (e.g. `.bashrc`, `.git/hooks/*`).
+/// `.mcp.json` at the root, `.claude` and anything under it that
+/// [`dot_claude_denial`] allows, `CLAUDE.md` in non-pruned subfolders up to
+/// 3 levels deep, and the folders leading to such a file. The import uses
+/// it to refuse any other project path a bundle may carry (e.g. `.bashrc`,
+/// `.git/hooks/*`). Built on the same predicates as `scan_project`.
 pub(crate) fn is_project_entry_shape(rel: &str, kind: &EntryKind) -> bool {
     let parts: Vec<&str> = rel.split('/').collect();
-    // Denied names are matched case- and normalization-insensitively (APFS
-    // folds both); allowed names must match exactly.
-    if fold(parts[0]) == ".claude" {
-        return parts[0] == ".claude"
-            && parts
-                .get(1)
-                .is_none_or(|second| fold(second) != "worktrees");
+    match dot_claude(parts[0]) {
+        DotClaude::Exact => {
+            let rest = rel.strip_prefix(".claude").unwrap_or_default();
+            return dot_claude_denial(rest.trim_start_matches('/')).is_none();
+        }
+        DotClaude::Variant => return false,
+        DotClaude::Other => {}
     }
     let (dirs, name) = parts.split_at(parts.len() - 1);
     let name = name[0];
     let dirs_ok = |dirs: &[&str]| {
-        dirs.len() <= NESTED_CLAUDE_MD_DEPTH
-            && !dirs
-                .iter()
-                .any(|d| PRUNED_DIRS.iter().any(|p| fold(d) == fold(p)))
+        dirs.len() <= NESTED_CLAUDE_MD_DEPTH && !dirs.iter().any(|d| is_pruned_dir(d))
     };
     match kind {
         EntryKind::Dir => dirs_ok(&parts),
@@ -308,7 +357,7 @@ pub(crate) fn is_project_entry_shape(rel: &str, kind: &EntryKind) -> bool {
 }
 
 /// NFC and lowercase: how a case-insensitive file system compares names.
-fn fold(name: &str) -> String {
+pub(crate) fn fold(name: &str) -> String {
     name.nfc().collect::<String>().to_lowercase()
 }
 
@@ -338,8 +387,19 @@ pub(crate) fn scan_project(
         if opts.excluded.contains(&path.as_path()) {
             return true;
         }
+        match dot_claude(parts[0]) {
+            DotClaude::Exact => {}
+            DotClaude::Variant => return true,
+            DotClaude::Other => {}
+        }
         if parts[0] == ".claude" {
-            if opts.skip_dot_claude || parts.get(1) == Some(&"worktrees") {
+            if opts.skip_dot_claude {
+                return true;
+            }
+            if let Some(reason) = dot_claude_denial(&parts[1..].join("/")) {
+                unreadable
+                    .borrow_mut()
+                    .push((rel.to_owned(), reason.to_owned()));
                 return true;
             }
             if let Some(err) = unreadable_dir(&path) {
@@ -358,7 +418,7 @@ pub(crate) fn scan_project(
             // Search locations only: an unreadable one is not reported.
             return !opts.nested
                 || parts.len() > NESTED_CLAUDE_MD_DEPTH
-                || PRUNED_DIRS.contains(&name)
+                || is_pruned_dir(name)
                 || fs::read_dir(&path).is_err();
         }
         if parts.len() == 1 {

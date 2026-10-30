@@ -523,3 +523,99 @@ fn container_category_is_fixed_precedence() {
     // `plugins` holds Settings and Cache: Settings wins.
     assert_eq!(category("plugins"), Some(Category::Settings));
 }
+
+#[test]
+fn project_scan_prunes_case_variants_and_never_names() {
+    let (_tmp, env) = setup();
+    let home = env.home.clone();
+    let app = home.join("code/app");
+    for (rel, text) in [
+        ("Vendor/CLAUDE.md", "v"),
+        ("Target/x/CLAUDE.md", "t"),
+        (".claude/Worktrees/w/a.md", "w"),
+        (".claude/.credentials.json", "{}"),
+        (".claude/Sessions/1.json", "{}"),
+        ("docs/CLAUDE.md", "kept"),
+    ] {
+        fs::create_dir_all(app.join(rel).parent().unwrap()).unwrap();
+        fs::write(app.join(rel), text).unwrap();
+    }
+    // `.Claude` cannot sit next to `.claude` on a case-insensitive disk.
+    let other = home.join("code/other");
+    fs::create_dir_all(other.join(".Claude")).unwrap();
+    fs::write(other.join(".Claude/CLAUDE.md"), "c").unwrap();
+    fs::write(other.join("CLAUDE.md"), "o").unwrap();
+    edit_claude_json(&env, |json| {
+        json["projects"]
+            .as_object_mut()
+            .unwrap()
+            .insert(other.to_str().unwrap().into(), serde_json::json!({}));
+    });
+
+    let inv = ClaudeAdapter { env: env.clone() }
+        .inventory(&selection(DEFAULT))
+        .unwrap();
+    let app_rels = rels(
+        &inv,
+        &RootKind::Project(ProjectId("github.com/acme/app".into())),
+    );
+    for denied in ["Vendor", "Target", "Worktrees", "credentials", "Sessions"] {
+        assert!(
+            !app_rels.iter().any(|r| r.contains(denied)),
+            "{denied}: {app_rels:?}"
+        );
+    }
+    assert!(
+        app_rels.contains(&"docs/CLAUDE.md".to_owned()),
+        "{app_rels:?}"
+    );
+    let other_rels = rels(
+        &inv,
+        &RootKind::Project(ProjectId(format!("path:{}", other.display()))),
+    );
+    assert_eq!(other_rels, vec!["CLAUDE.md"], "{other_rels:?}");
+    let reason = inv
+        .skipped
+        .iter()
+        .find(|(k, _)| k.ends_with(".claude/.credentials.json"))
+        .map(|(_, r)| r.as_str());
+    assert!(
+        reason.is_some_and(|r| r.contains("sır")),
+        "{:?}",
+        inv.skipped
+    );
+}
+
+#[test]
+fn stale_home_claude_dir_with_config_override_is_dropped() {
+    let (_tmp, base) = setup();
+    let home = base.home.clone();
+    let cfg = home.join("cfg");
+    fs::create_dir_all(&cfg).unwrap();
+    // The live config lists the home as a project; `~/.claude` is stale.
+    fs::write(
+        cfg.join(".claude.json"),
+        serde_json::json!({"projects": {home.to_str().unwrap(): {}}}).to_string(),
+    )
+    .unwrap();
+    fs::write(home.join("CLAUDE.md"), "# Home\n").unwrap();
+    let env = VtEnv::new(home.clone(), "alice".into(), Some(cfg));
+    let inv = ClaudeAdapter { env }
+        .inventory(&selection(DEFAULT))
+        .unwrap();
+
+    let home_root = RootKind::Project(ProjectId(format!("path:{}", home.display())));
+    let home_rels = rels(&inv, &home_root);
+    assert_eq!(home_rels, vec!["CLAUDE.md"], "{home_rels:?}");
+    let note = inv
+        .skipped
+        .iter()
+        .find(|(k, _)| k == &format!("project:path:{}:.claude", home.display()))
+        .map(|(_, r)| r.clone())
+        .unwrap_or_default();
+    assert!(note.contains("CLAUDE_CONFIG_DIR"), "{:?}", inv.skipped);
+    assert!(
+        note.contains(home.join(".claude").to_str().unwrap()),
+        "{note}"
+    );
+}

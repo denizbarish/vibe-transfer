@@ -11,7 +11,7 @@ use vt_core::manifest::{Category, Class, Entry, EntryKind, ProjectRef, RootKind,
 use vt_core::scan::{NON_UTF8_NAME, NON_UTF8_TARGET, RawEntry, scan_tree, stat_entry};
 
 use crate::ClaudeAdapter;
-use crate::projects::{ProjectScanOptions, UNREADABLE, scan_project, unreadable_dir};
+use crate::projects::{ProjectScanOptions, UNREADABLE, fold, scan_project, unreadable_dir};
 
 const UNSELECTED: &str = "kullanıcı seçimiyle atlandı";
 const NEVER: &str = "asla taşınmaz: makineye özgü";
@@ -21,6 +21,8 @@ const UNCLASSIFIED_NOTE: &str = "sınıflandırılmamış: isteğe bağlı öğe
 const SPECIAL: &str = "özel dosya";
 const EMPTY_DIR: &str = "içinde aktarılacak öğe yok";
 const MISSING_PROJECT: &str = "proje klasörü bu makinede yok";
+const STALE_CLAUDE_DIR: &str =
+    "eski Claude klasörü, CLAUDE_CONFIG_DIR başka yeri gösteriyor; proje verisi olarak aktarılmadı";
 const INSIDE_CLAUDE_DIR: &str = "Claude klasörünün içinde, ayrıca taşınmaz";
 
 /// Everything the Claude adapter would transfer for a selection.
@@ -128,6 +130,15 @@ fn rule(rel: &str) -> Rule {
     }
 }
 
+/// `classify` with the first two components case- and NFC-folded, as a
+/// case-insensitive file system would match them. Used for project
+/// `.claude` folders, where a variant of a never-transferred name must be
+/// refused too.
+pub(crate) fn classify_folded(rel: &str) -> Option<(Class, Category)> {
+    let parts: Vec<String> = rel.split('/').map(fold).collect();
+    classify(&parts.join("/"))
+}
+
 /// Machine-specific paths that are never transferred. Lock files count only
 /// where Claude itself writes them (top level, `tasks/<id>/.lock`, `ide/`);
 /// a lock file in user data such as `skills/x/bun.lock` is user content.
@@ -155,10 +166,9 @@ fn is_never(parts: &[&str]) -> bool {
         )
         || matches!(
             (first, second),
-            ("plugins", Some("synced"))
-                | ("security", Some("agent-sdk-venv"))
-                | (".claude", Some("worktrees"))
+            ("plugins", Some("synced")) | ("security", Some("agent-sdk-venv"))
         )
+        || (fold(first) == ".claude" && second.is_some_and(|s| fold(s) == "worktrees"))
 }
 
 fn selected(sel: &Selection, category: Category) -> bool {
@@ -452,8 +462,24 @@ impl Collector<'_> {
             self.skip(&root_kind, "", INSIDE_CLAUDE_DIR);
             return;
         }
+        // With CLAUDE_CONFIG_DIR the live Claude dir is elsewhere; the home's
+        // `.claude` is a stale one, not project data.
+        let stale = env.claude_config_dir_override.is_some()
+            && same_path(root, &env.home)
+            && fs::symlink_metadata(root.join(".claude")).is_ok();
+        if stale {
+            self.skip(
+                &root_kind,
+                ".claude",
+                format!(
+                    "{STALE_CLAUDE_DIR} ({}; CLAUDE_CONFIG_DIR: {})",
+                    root.join(".claude").display(),
+                    claude_dir.display()
+                ),
+            );
+        }
         let opts = ProjectScanOptions {
-            skip_dot_claude: same_path(&root.join(".claude"), claude_dir),
+            skip_dot_claude: stale || same_path(&root.join(".claude"), claude_dir),
             // The home dir (or a parent of it) is never walked for nested
             // CLAUDE.md files: it holds other projects and protected folders.
             nested: !env.home.starts_with(root),

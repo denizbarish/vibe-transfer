@@ -808,3 +808,54 @@ fn import_asks_for_root_and_home_ancestor() {
     let ancestor = fx.dst.parent().unwrap().to_path_buf();
     assert_mapping_is_asked(&fx, &ancestor);
 }
+
+#[test]
+fn export_prunes_what_import_refuses_and_the_bundle_imports() {
+    let fx = setup();
+    let app = fx.src_app();
+    for (rel, text) in [
+        ("Vendor/CLAUDE.md", "v"),
+        ("Target/x/CLAUDE.md", "t"),
+        (".claude/Worktrees/w/a.md", "w"),
+        (".claude/.credentials.json", "{}"),
+        (".claude/settings.json", "{}"),
+    ] {
+        write(&app.join(rel), text);
+    }
+    // `.Claude` cannot sit next to `.claude` on a case-insensitive disk.
+    write(&fx.src_lost().join(".Claude/CLAUDE.md"), "c");
+    let bundle = export(&fx);
+
+    let staging = fx.tmp.path().join("inspect");
+    let rb = vt_core::bundle::read_bundle(&bundle, &SecretString::from(PASS.to_owned()), &staging)
+        .unwrap();
+    let rels: Vec<&str> = rb
+        .manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e.root, vt_core::manifest::RootKind::Project(_)))
+        .map(|e| e.rel.as_str())
+        .collect();
+    for denied in ["Vendor", "Target", "Worktrees", "credentials", ".Claude"] {
+        assert!(
+            !rels.iter().any(|r| r.contains(denied)),
+            "{denied}: {rels:?}"
+        );
+    }
+    assert!(rels.contains(&".claude/settings.json"), "{rels:?}");
+    assert!(
+        rb.manifest
+            .notes
+            .iter()
+            .any(|n| n.contains(".credentials.json")),
+        "{:?}",
+        rb.manifest.notes
+    );
+
+    let i = import(&fx, &bundle, None, None);
+    ok(&i);
+    assert!(fx.dst_app().join(".claude/settings.json").exists());
+    assert!(!fx.dst_app().join(".claude/.credentials.json").exists());
+    let rep = report(&fx, &i);
+    assert_eq!(rep["problems"], json!([]), "{rep}");
+}
