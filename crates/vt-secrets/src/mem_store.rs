@@ -21,6 +21,11 @@ impl MemStore {
         Self::default()
     }
 
+    /// `(service, account)` of every stored item, sorted.
+    pub fn keys(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.lock()?.keys().cloned().collect())
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<Key, SecretBytes>>> {
         self.items
             .lock()
