@@ -1,0 +1,29 @@
+[package]
+name = "vt-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+age = "0.12.1"
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+filetime = "0.2.29"
+rand = "0.8.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sysinfo = { version = "0.40.0", default-features = false, features = ["system"] }
+unicode-normalization = "0.1.26"
+zeroize = "1.9.1"
+zstd = "0.14.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# Enables test-util for this crate's own integration tests.
+vt-core = { path = ".", features = ["test-util"] }
+
+[features]
+# Exposes test-only helpers (bundle tampering); never enabled by default.
+test-util = []

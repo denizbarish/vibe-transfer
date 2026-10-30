@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+# Linux test container: format check, clippy and the whole test suite.
+#   docker build -f Dockerfile.test .
+# The network is used only by `cargo fetch`; every check runs offline.
+FROM rust:1.98.1
+
+# Tests check file permissions, which root ignores: run them as a user.
+RUN useradd --create-home tester
+USER tester
+ENV CARGO_HOME=/home/tester/.cargo
+WORKDIR /home/tester/src
+
+COPY --chown=tester:tester . .
+RUN rustup show active-toolchain && cargo fetch --locked
+
+RUN --network=none cargo fmt --all --check
+RUN --network=none cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+RUN --network=none cargo test --workspace --quiet --locked --offline

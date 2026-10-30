@@ -1,0 +1,17 @@
+[package]
+name = "vt-claude"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+unicode-normalization = "0.1.26"
+vt-core = { path = "../vt-core" }
+
+[dev-dependencies]
+blake3 = "1.8.7"
+tempfile = "3.27.0"
