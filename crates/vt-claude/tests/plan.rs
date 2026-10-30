@@ -239,3 +239,137 @@ fn dest_templates_resolve_below_the_project() {
     assert!(resolve_dest_template(&escape, &root, &fx.env).is_err());
     assert!(resolve_dest_template(&rel, Path::new("relative"), &fx.env).is_err());
 }
+
+fn app_project(fx: &Fx) -> (ProjectId, ProjectRef, BTreeMap<ProjectId, Mapping>) {
+    let id = ProjectId("github.com/acme/app".into());
+    let project = ProjectRef {
+        id: id.clone(),
+        old_path: "/Users/alice/app".into(),
+        remote: Some(id.0.clone()),
+        is_git: true,
+    };
+    let mut mappings = BTreeMap::new();
+    mappings.insert(id.clone(), Mapping::Auto(fx.env.home.join("code/app")));
+    (id, project, mappings)
+}
+
+fn dir(index: u32, root: RootKind, rel: &str) -> Entry {
+    Entry {
+        index,
+        tool: Tool::Claude,
+        category: Category::ProjectFiles,
+        root,
+        rel: rel.into(),
+        kind: EntryKind::Dir,
+        size: 0,
+        mtime_ns: 0,
+        mode: 0o755,
+        hash: None,
+        partial_tail: false,
+    }
+}
+
+#[test]
+fn project_entries_outside_claude_shapes_reject_the_plan() {
+    let fx = fx();
+    let (id, project, mappings) = app_project(&fx);
+    let root = RootKind::Project(id.clone());
+    for rel in [
+        ".bashrc",
+        ".git/hooks/pre-commit",
+        ".ssh/authorized_keys",
+        "src/main.rs",
+        ".claude/worktrees/wt/x.md",
+        "a/b/c/d/CLAUDE.md",
+        "node_modules/x/CLAUDE.md",
+    ] {
+        let rb = bundle(
+            &fx,
+            vec![file(&fx, 0, root.clone(), rel, b"x")],
+            vec![project.clone()],
+        );
+        let err = plan(&fx, &rb, &mappings).unwrap_err();
+        assert!(format!("{err:#}").contains("reddedildi"), "{rel}: {err:#}");
+        // Also when the project would only go to the pending store.
+        let mut pending = mappings.clone();
+        pending.insert(id.clone(), Mapping::Pending);
+        assert!(plan(&fx, &rb, &pending).is_err(), "{rel}");
+    }
+    let ok = vec![
+        file(&fx, 0, root.clone(), "CLAUDE.md", b"a"),
+        file(&fx, 1, root.clone(), "CLAUDE.local.md", b"b"),
+        file(&fx, 2, root.clone(), ".mcp.json", b"{}"),
+        file(&fx, 3, root.clone(), ".claude/settings.json", b"{}"),
+        file(&fx, 4, root.clone(), ".claude/agents/r.md", b"c"),
+        dir(5, root.clone(), "docs"),
+        file(&fx, 6, root.clone(), "docs/CLAUDE.md", b"d"),
+        file(&fx, 7, root.clone(), "a/b/c/CLAUDE.md", b"e"),
+    ];
+    let rb = bundle(&fx, ok, vec![project]);
+    plan(&fx, &rb, &mappings).unwrap();
+    assert!(fs::read_dir(&fx.env.home).unwrap().next().is_none());
+}
+
+#[test]
+fn control_characters_in_paths_reject_the_plan() {
+    let fx = fx();
+    for rel in [
+        "agents/\u{1b}]0;x\u{7}.md",
+        "agents/a\nb.md",
+        "agents/\u{9b}31m.md",
+    ] {
+        let rb = bundle(
+            &fx,
+            vec![file(&fx, 0, RootKind::ClaudeDir, rel, b"x")],
+            Vec::new(),
+        );
+        let err = plan(&fx, &rb, &BTreeMap::new()).unwrap_err();
+        assert!(format!("{err:#}").contains("geçersiz"), "{err:#}");
+    }
+}
+
+#[test]
+fn symlink_into_a_project_follows_the_project_mapping() {
+    let fx = fx();
+    let (_, project, mappings) = app_project(&fx);
+    let link = |index: u32, rel: &str, target: &str| Entry {
+        index,
+        tool: Tool::Claude,
+        category: Category::Settings,
+        root: RootKind::ClaudeDir,
+        rel: rel.into(),
+        kind: EntryKind::Symlink {
+            target: target.into(),
+        },
+        size: 0,
+        mtime_ns: 0,
+        mode: 0o755,
+        hash: None,
+        partial_tail: false,
+    };
+    let rb = bundle(
+        &fx,
+        vec![
+            link(0, "skills/app-skill", "/Users/alice/app/.claude/skills/x"),
+            link(1, "skills/other", "/Users/alice/tools/y"),
+            link(2, "skills/rel", "../shared/z"),
+        ],
+        vec![project],
+    );
+    let p = plan(&fx, &rb, &mappings).unwrap();
+    let target = |i: u32| match &p
+        .plan
+        .placements
+        .iter()
+        .find(|x| x.entry_index == i)
+        .unwrap()
+        .kind
+    {
+        EntryKind::Symlink { target } => target.clone(),
+        other => panic!("{other:?}"),
+    };
+    let home = fx.env.home.to_str().unwrap();
+    assert_eq!(target(0), format!("{home}/code/app/.claude/skills/x"));
+    assert_eq!(target(1), format!("{home}/tools/y"));
+    assert_eq!(target(2), "../shared/z");
+}

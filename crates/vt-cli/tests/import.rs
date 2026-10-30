@@ -622,3 +622,138 @@ fn import_warns_cleanup_period() {
     let rep = report(&fx, &i);
     assert_eq!(rep["problems"], json!([]), "{rep}");
 }
+
+#[test]
+fn import_asks_before_mapping_a_project_onto_the_target_home() {
+    let fx = setup();
+    // A session opened in the source home: its project is the home itself.
+    let home_session = fx.slug_dir(&fx.src, &fx.src).join("sess-home.jsonl");
+    write(
+        &home_session,
+        &format!(
+            "{}\n",
+            json!({"type": "user", "cwd": fx.src, "sessionId": "sess-home"})
+        ),
+    );
+    let bundle = export(&fx);
+    let id = format!("path:{}", fx.src.display());
+
+    let refused = import(&fx, &bundle, None, None);
+    assert!(!refused.output.status.success());
+    let stderr = text(&refused.output.stderr);
+    assert!(stderr.contains("terminal"), "{stderr}");
+    assert!(!fx.dst.join(".claude").exists());
+
+    let i = import(
+        &fx,
+        &bundle,
+        Some(json!({"choose": {id: fx.dst.to_str().unwrap()}})),
+        None,
+    );
+    ok(&i);
+    assert!(
+        fx.slug_dir(&fx.dst, &fx.dst)
+            .join("sess-home.jsonl")
+            .exists()
+    );
+}
+
+#[test]
+fn import_reports_apply_conflicts() {
+    let fx = setup();
+    let bundle = export(&fx);
+    // The target's agents folder is a symlink (user setup): a replace
+    // leaves it alone and must say so.
+    let real = fx.dst.join("dotfiles/agents");
+    write(&real.join("mine.md"), "mine\n");
+    fs::create_dir_all(fx.dst.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&real, fx.dst.join(".claude/agents")).unwrap();
+
+    let i = import(&fx, &bundle, Some(json!({"decision": "replace"})), None);
+    ok(&i);
+    let rep = report(&fx, &i);
+    assert!(rep["conflicts"].to_string().contains("symlink"), "{rep}");
+    assert!(
+        i.summary["conflicts"].to_string().contains("symlink"),
+        "{}",
+        i.summary
+    );
+    assert!(real.join("mine.md").exists());
+}
+
+#[test]
+fn import_never_prints_bundle_control_sequences_raw() {
+    let fx = setup();
+    // An unclassified file whose name carries ESC/OSC/BEL: the export skips
+    // it and quotes the name in the manifest notes.
+    write(
+        &fx.src.join(".claude/evil\u{1b}]0;pwned\u{7}\u{1b}[31m.txt"),
+        "x\n",
+    );
+    let bundle = export(&fx);
+
+    let output = run(
+        &fx.dst,
+        "dst",
+        &["import", bundle.to_str().unwrap(), "--passphrase-stdin"],
+        &[],
+        None,
+    );
+    let (stdout, stderr) = (text(&output.stdout), text(&output.stderr));
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    for shown in [&stdout, &stderr] {
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+            "{shown:?}"
+        );
+    }
+    assert!(stdout.contains("evil\\u{1b}]0;pwned\\u{7}"), "{stdout}");
+
+    // `--json` stays a faithful JSON encoding (escaped by serde).
+    let fx2 = setup();
+    write(&fx2.src.join(".claude/evil\u{1b}[31m.txt"), "x\n");
+    let bundle = export(&fx2);
+    let i = import(&fx2, &bundle, None, None);
+    ok(&i);
+    assert!(!text(&i.output.stdout).contains('\u{1b}'));
+    assert!(
+        i.summary["source_notes"]
+            .to_string()
+            .contains("evil\\u001b[31m.txt"),
+        "{}",
+        i.summary
+    );
+}
+
+#[test]
+fn import_kept_account_without_target_item_moves_mcp_oauth() {
+    let fx = setup();
+    let mcp = json!({"srv": {"accessToken": format!("{}{}", "synthetic-", "mcp-value")}});
+    let mut value: Value = serde_json::from_str(&fake_token("src")).unwrap();
+    value["mcpOAuth"] = mcp.clone();
+    write(
+        &fx.tmp.path().join("src-secrets.json"),
+        &json!([{"service": SERVICE, "account": "src", "value": value.to_string()}]).to_string(),
+    );
+    let bundle = export(&fx);
+    write(
+        &fx.dst.join(".claude.json"),
+        &json!({"oauthAccount": {"accountUuid": "uuid-dst"}}).to_string(),
+    );
+
+    let i = import(
+        &fx,
+        &bundle,
+        Some(json!({"decision": "merge", "account": "keep_target"})),
+        None,
+    );
+    ok(&i);
+    let expected = json!({"mcpOAuth": mcp}).to_string();
+    assert_eq!(secret_digest(&i, "dst"), Some(digest(&expected)));
+    assert_eq!(
+        read_json(&fx.dst.join(".claude.json"))["oauthAccount"]["accountUuid"],
+        "uuid-dst"
+    );
+    assert!(!text(&i.output.stdout).contains("logout-source"));
+    no_leaks(&fx, &i, &[fake_token("src"), "synthetic-mcp-value".into()]);
+}

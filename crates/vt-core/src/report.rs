@@ -41,6 +41,10 @@ pub struct VerifyReport {
     /// `(item, reason)` for everything not transferred or not changed.
     pub skipped: Vec<(String, String)>,
     pub problems: Vec<String>,
+    /// What `apply` reported as a conflict: target files resolved by a
+    /// rule or the user, replace scopes left alone (e.g. symlinked).
+    #[serde(default)]
+    pub conflicts: Vec<String>,
 }
 
 /// Checks every object `plan` placed. `kept_target` holds the dests where

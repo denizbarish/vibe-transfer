@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use vt_claude::{
     ClaudePlan, PlanInput, PlanQuestions, build_claude_apply_plan, read_claude_json_stable,
 };
@@ -39,6 +39,7 @@ const CLEANUP_MARGIN_DAYS: u64 = 30;
 /// Login part of the Claude Keychain value; the rest (MCP OAuth and the
 /// like) moves even when the target keeps its own account.
 const LOGIN_KEY: &str = "claudeAiOauth";
+const KEPT_SECRET_KEY: &str = "hedefteki farklı değer korundu (giriş dışı sır anahtarı)";
 const KEPT_ACCOUNT: &str = "hedef hesabı korundu; giriş token'ı aktarılmadı";
 
 /// Removes the session staging folder however the import ends.
@@ -79,6 +80,7 @@ struct Summary {
     transformed: usize,
     skipped: Vec<Item>,
     problems: Vec<String>,
+    conflicts: Vec<String>,
     source_notes: Vec<String>,
     cleanup_suggestion: Option<u64>,
     logout_command: Option<String>,
@@ -177,6 +179,7 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<()> {
         .filter(|(_, r)| **r == Resolution::KeepTarget)
         .map(|(d, _)| d.clone())
         .collect();
+    report.conflicts.extend(applied.conflicts.iter().cloned());
     verify_plan(&plan.plan, &applied, &kept_target, &mut report);
     check_sessions(
         &plan,
@@ -221,6 +224,7 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<()> {
             })
             .collect(),
         problems: report.problems.clone(),
+        conflicts: report.conflicts.clone(),
         source_notes: rb.manifest.notes.clone(),
         cleanup_suggestion,
         logout_command: token_moved.then(|| {
@@ -246,6 +250,8 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<()> {
 }
 
 fn print_human(s: &Summary, skipped: &[(String, String)]) {
+    // Bundle-supplied text (ids, paths, notes) is shown through `ui::clean`.
+    let c = ui::clean;
     println!("İçe aktarıldı. Oturum: {}", s.session_id);
     println!(
         "Yerleştirilen: {}, zaten aynı: {}, yedeklenen: {}, yan yana tutulan: {}",
@@ -256,34 +262,42 @@ fn print_human(s: &Summary, skipped: &[(String, String)]) {
         s.verified, s.expected, s.transformed
     );
     for m in &s.mapped {
-        println!("Eşlendi: {} -> {}", m.project, m.path);
+        println!("Eşlendi: {} -> {}", c(&m.project), c(&m.path));
     }
     if !s.pending.is_empty() {
         println!("Bekleme alanında: {}", s.pending.len());
         for id in &s.pending {
-            println!("    {id}");
+            println!("    {}", c(id));
         }
     }
     ui::print_grouped("Atlananlar", skipped);
+    if !s.conflicts.is_empty() {
+        println!("Çakışmalar: {}", s.conflicts.len());
+        for conflict in &s.conflicts {
+            println!("    {}", c(conflict));
+        }
+    }
     if !s.source_notes.is_empty() {
         println!("Kaynaktaki dışa aktarma notları: {}", s.source_notes.len());
         for note in &s.source_notes {
-            println!("    {note}");
+            println!("    {}", c(note));
         }
     }
     for p in &s.problems {
-        println!("SORUN: {p}");
+        println!("SORUN: {}", c(p));
     }
-    println!("Rapor: {}", s.report_path);
+    println!("Rapor: {}", c(&s.report_path));
     if let Some(cmd) = &s.logout_command {
         println!(
             "Giriş token'ı taşındı. Hedefte çalıştığını doğruladıktan sonra kaynakta çalıştırın:"
         );
-        println!("    {cmd}");
+        println!("    {}", c(cmd));
     }
 }
 
-/// Target path per manifest project; several candidates are asked.
+/// Target path per manifest project; several candidates are asked. A
+/// project that would map onto the target home or `/` (from a path the
+/// bundle supplied) is asked too, never taken automatically.
 fn map_projects(
     ctx: &Ctx,
     args: &ImportArgs,
@@ -300,6 +314,12 @@ fn map_projects(
     let mut out = BTreeMap::new();
     for p in &rb.manifest.projects {
         let mapping = match map_project(p, &idx, src_home, &ctx.env.home) {
+            Mapping::Auto(path) if path == ctx.env.home || path == Path::new("/") => {
+                match prompter.choose_path(p, std::slice::from_ref(&path))? {
+                    Some(path) => Mapping::Auto(path),
+                    None => Mapping::Pending,
+                }
+            }
             Mapping::Choose(candidates) => match prompter.choose_path(p, &candidates)? {
                 Some(path) => Mapping::Auto(path),
                 None => Mapping::Pending,
@@ -431,10 +451,16 @@ fn import_secret(
         item.value.clone()
     } else {
         report.skipped.push((key.clone(), KEPT_ACCOUNT.to_owned()));
-        match previous
-            .as_ref()
-            .and_then(|prev| non_login_extras(prev, &item.value))
-        {
+        let extras = non_login_extras(previous.as_ref(), &item.value);
+        for k in &extras.kept {
+            report
+                .skipped
+                .push((format!("{key}#{k}"), KEPT_SECRET_KEY.to_owned()));
+        }
+        if let Some(reason) = extras.unusable {
+            report.skipped.push((key.clone(), reason.to_owned()));
+        }
+        match extras.value {
             Some(merged) => merged,
             None => return Ok(false),
         }
@@ -456,14 +482,38 @@ fn import_secret(
     Ok(take_oauth)
 }
 
-/// The target value plus the source's non-login parts it lacks (e.g. MCP
-/// OAuth entries); `None` when nothing would change or either side is not
-/// a JSON object.
-fn non_login_extras(target: &SecretBytes, source: &SecretBytes) -> Option<SecretBytes> {
-    let mut t: Value = serde_json::from_slice(target.expose()).ok()?;
-    let s: Value = serde_json::from_slice(source.expose()).ok()?;
-    let (Value::Object(tm), Value::Object(sm)) = (&mut t, &s) else {
-        return None;
+/// What the target keeps when it keeps its own login.
+struct Extras {
+    /// The new target value; `None` when nothing changes.
+    value: Option<SecretBytes>,
+    /// Keys (never values) where the target's differing value was kept.
+    kept: Vec<String>,
+    /// Why the non-login parts could not be merged, if so.
+    unusable: Option<&'static str>,
+}
+
+/// The target value (or, with none, an empty object) plus the source's
+/// non-login parts it lacks, e.g. MCP OAuth entries. Same-name keys with a
+/// different value keep the target's and are listed in `kept`.
+fn non_login_extras(target: Option<&SecretBytes>, source: &SecretBytes) -> Extras {
+    let mut out = Extras {
+        value: None,
+        kept: Vec::new(),
+        unusable: None,
+    };
+    let Ok(Value::Object(sm)) = serde_json::from_slice::<Value>(source.expose()) else {
+        out.unusable =
+            Some("kaynak sır değeri JSON nesnesi değil; giriş dışı kısımlar aktarılmadı");
+        return out;
+    };
+    let mut tm = match target.map(|t| serde_json::from_slice::<Value>(t.expose())) {
+        None => Map::new(),
+        Some(Ok(Value::Object(m))) => m,
+        Some(_) => {
+            out.unusable =
+                Some("hedef sır değeri JSON nesnesi değil; giriş dışı kısımlar aktarılmadı");
+            return out;
+        }
     };
     let mut changed = false;
     for (k, v) in sm.iter().filter(|(k, _)| k.as_str() != LOGIN_KEY) {
@@ -474,19 +524,28 @@ fn non_login_extras(target: &SecretBytes, source: &SecretBytes) -> Option<Secret
             }
             (Some(Value::Object(te)), Value::Object(se)) => {
                 for (name, entry) in se {
-                    if !te.contains_key(name) {
-                        te.insert(name.clone(), entry.clone());
-                        changed = true;
+                    match te.get(name) {
+                        None => {
+                            te.insert(name.clone(), entry.clone());
+                            changed = true;
+                        }
+                        Some(existing) if existing != entry => {
+                            out.kept.push(format!("{k}.{name}"));
+                        }
+                        Some(_) => {}
                     }
                 }
             }
-            _ => {}
+            (Some(existing), _) if existing != v => out.kept.push(k.clone()),
+            (Some(_), _) => {}
         }
     }
-    if !changed {
-        return None;
+    if changed {
+        out.value = serde_json::to_vec(&Value::Object(tm))
+            .ok()
+            .map(SecretBytes::new);
     }
-    serde_json::to_vec(&t).ok().map(SecretBytes::new)
+    out
 }
 
 fn backup_secret(
@@ -627,6 +686,32 @@ fn cleanup_period(
         after: hash_bytes(&json_bytes(&settings)),
         kind: "cleanup_period".into(),
     });
+    report.conflicts.extend(applied.conflicts.iter().cloned());
     verify_plan(&mini, &applied, &BTreeSet::new(), report);
     Ok(Some(suggested))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(v: Value) -> SecretBytes {
+        SecretBytes::new(serde_json::to_vec(&v).unwrap())
+    }
+
+    #[test]
+    fn kept_target_keys_are_listed_without_values() {
+        let target = bytes(
+            json!({"claudeAiOauth": {"t": "a"}, "mcpOAuth": {"x": "target", "y": "same"}, "other": 1}),
+        );
+        let source = bytes(
+            json!({"claudeAiOauth": {"t": "b"}, "mcpOAuth": {"x": "source", "y": "same", "z": "new"}, "other": 2}),
+        );
+        let out = non_login_extras(Some(&target), &source);
+        assert_eq!(out.kept, vec!["mcpOAuth.x".to_owned(), "other".to_owned()]);
+        let merged: Value = serde_json::from_slice(out.value.unwrap().expose()).unwrap();
+        assert_eq!(merged["claudeAiOauth"]["t"], "a");
+        assert_eq!(merged["mcpOAuth"]["x"], "target");
+        assert_eq!(merged["mcpOAuth"]["z"], "new");
+    }
 }

@@ -16,6 +16,22 @@ use vt_core::manifest::{Category, JsonConflict, ProjectRef, Selection, Tool};
 /// Report lines shown per reason before the rest is only counted.
 const LIST_LIMIT: usize = 20;
 
+/// Makes text safe for a terminal: every control character (C0, DEL, C1,
+/// so also ESC and the start of OSC/CSI sequences) is shown as `\u{..}`.
+/// All bundle-supplied text goes through this before it is printed or used
+/// in a prompt; `--json` output is not affected (serde escapes it).
+pub fn clean(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", u32::from(ch)));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Whether the user can answer prompts: stdin and stderr are terminals.
 pub fn interactive() -> bool {
     io::stdin().is_terminal() && io::stderr().is_terminal()
@@ -147,11 +163,11 @@ pub fn print_grouped(title: &str, items: &[(String, String)]) {
     for (path, reason) in items {
         groups.entry(reason).or_default().push(path);
     }
-    println!("{title}: {}", items.len());
+    println!("{}: {}", clean(title), items.len());
     for (reason, paths) in groups {
-        println!("  {reason} ({})", paths.len());
+        println!("  {} ({})", clean(reason), paths.len());
         for path in paths.iter().take(LIST_LIMIT) {
-            println!("    {path}");
+            println!("    {}", clean(path));
         }
         if paths.len() > LIST_LIMIT {
             println!(
@@ -276,8 +292,8 @@ impl<'a> Prompter<'a> {
     pub fn project_decision(&mut self, project: &ProjectRef, root: &Path) -> Result<Decision> {
         let question = format!(
             "{} projesinde ({}) hedefte farklı içerik var. Birleştir mi, değiştir mi?",
-            project.id.0,
-            root.display()
+            clean(&project.id.0),
+            clean(&root.display().to_string())
         );
         match self.answers {
             Some(a) => match a.projects.get(&project.id.0).or(a.decision.as_ref()) {
@@ -291,8 +307,9 @@ impl<'a> Prompter<'a> {
     /// `true`: replace the target account with the source's.
     pub fn take_source_account(&mut self, target: &str, source: Option<&str>) -> Result<bool> {
         let question = format!(
-            "Hedef başka bir Claude hesabıyla girişli ({target}; kaynak: {}). Hangisi kalsın?",
-            source.unwrap_or("bilinmiyor")
+            "Hedef başka bir Claude hesabıyla girişli ({}; kaynak: {}). Hangisi kalsın?",
+            clean(target),
+            clean(source.unwrap_or("bilinmiyor"))
         );
         match self.answers {
             Some(a) => match a.account.as_deref() {
@@ -320,7 +337,10 @@ impl<'a> Prompter<'a> {
         project: &ProjectRef,
         candidates: &[PathBuf],
     ) -> Result<Option<PathBuf>> {
-        let question = format!("{} hedefte birden çok yerde var. Hangisi?", project.id.0);
+        let question = format!(
+            "{} için hedef yol onayı gerekiyor. Hangisi?",
+            clean(&project.id.0)
+        );
         match self.answers {
             Some(a) => match a.choose.get(&project.id.0).map(String::as_str) {
                 Some("pending") => Ok(None),
@@ -337,8 +357,10 @@ impl<'a> Prompter<'a> {
                 if !interactive() {
                     return Err(no_terminal(&question));
                 }
-                let mut items: Vec<String> =
-                    candidates.iter().map(|p| p.display().to_string()).collect();
+                let mut items: Vec<String> = candidates
+                    .iter()
+                    .map(|p| clean(&p.display().to_string()))
+                    .collect();
                 items.push("Bekleme alanına koy".to_owned());
                 let labels: Vec<&str> = items.iter().map(String::as_str).collect();
                 let picked = select(&question, &labels)?;
@@ -351,7 +373,10 @@ impl<'a> Prompter<'a> {
         if let Some(r) = self.all_files {
             return Ok(r);
         }
-        let question = format!("Hedefte farklı içerikli dosya var: {}", dest.display());
+        let question = format!(
+            "Hedefte farklı içerikli dosya var: {}",
+            clean(&dest.display().to_string())
+        );
         match self.answers {
             Some(a) => match a.file.as_deref() {
                 Some("source") => Ok(Resolution::KeepSource),
@@ -396,7 +421,7 @@ impl<'a> Prompter<'a> {
         if let Some(r) = self.all_json {
             return Ok(r);
         }
-        let question = format!("JSON anahtarı iki tarafta farklı: {}", c.path);
+        let question = format!("JSON anahtarı iki tarafta farklı: {}", clean(&c.path));
         match self.answers {
             Some(a) => match a.json.as_deref() {
                 Some("source") => Ok(Resolution::KeepSource),

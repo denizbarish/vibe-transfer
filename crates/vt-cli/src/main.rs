@@ -91,7 +91,8 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("hata: {e:#}");
+            // Errors may quote bundle-supplied text.
+            eprintln!("hata: {}", ui::clean(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }

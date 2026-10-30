@@ -30,8 +30,8 @@ use vt_core::scan::hash_file;
 use crate::claude_json::read_claude_json_stable;
 use crate::inventory::classify;
 use crate::merge::{merge_claude_json, merge_json_settings, merge_memory_md};
-use crate::projects::first_cwds;
-use crate::transform::{memory_slug_for, rewrite_json_paths, target_slug_dir};
+use crate::projects::{first_cwds, is_project_entry_shape};
+use crate::transform::{memory_slug_for, rewrite_json_paths, rewrite_path_value, target_slug_dir};
 
 /// Text files larger than this are placed unchanged.
 const TEXT_REWRITE_MAX: u64 = 1024 * 1024;
@@ -136,6 +136,15 @@ pub fn build_claude_apply_plan(
     let m = &rb.manifest;
     for e in &m.entries {
         check_rel(e)?;
+        if let RootKind::Project(id) = &e.root
+            && !is_project_entry_shape(&e.rel, &e.kind)
+        {
+            bail!(
+                "paket, {} projesinde Claude dosyası olmayan bir yol içeriyor: {:?}; içe aktarma reddedildi",
+                id.0,
+                e.rel
+            );
+        }
     }
     for (id, mapping) in input.mappings {
         match mapping {
@@ -492,7 +501,7 @@ impl Builder<'_> {
                 Ok(())
             }
             EntryKind::Symlink { target } => {
-                let new = rewrite_home(target, &self.src_home, &self.dst_home);
+                let new = rewrite_path_value(target, &self.src_home, &self.dst_home, &self.mapped);
                 if new != *target {
                     let (b, a) = (hash_bytes(target.as_bytes()), hash_bytes(new.as_bytes()));
                     self.record(&dest, b, a, KIND_SYMLINK_TARGET);
@@ -969,7 +978,11 @@ fn safe_join(base: &Path, rel: &str, need_name: bool) -> Result<PathBuf> {
         return Ok(base.to_path_buf());
     }
     let ok = rel.split('/').all(|part| {
-        !part.is_empty() && part != "." && part != ".." && !part.contains(['\0', '\\'])
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains('\\')
+            && !part.chars().any(char::is_control)
     });
     if !ok {
         bail!("geçersiz kayıt yolu, hedef kökünün dışına çıkabilir: {rel:?}");

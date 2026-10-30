@@ -105,6 +105,23 @@ pub fn rewrite_json_paths(
     out
 }
 
+/// One string value under the rule of `rewrite_json_paths` (R12): a whole
+/// path is mapped through `project_map` first, then the home rewrite; text
+/// with embedded paths gets the home rewrite only. Used for symlink targets.
+pub(crate) fn rewrite_path_value(
+    s: &str,
+    src_home: &str,
+    dst_home: &str,
+    project_map: &BTreeMap<String, PathBuf>,
+) -> String {
+    let rw = Rewriter {
+        src_home,
+        dst_home,
+        project_map,
+    };
+    rw.string(s).unwrap_or_else(|| s.to_owned())
+}
+
 /// Rewrites the top-level `cwd` string of one jsonl line, leaving every
 /// other byte of the line as it was. `None` when the line is not a JSON
 /// object, has no string `cwd`, or `map` gives no different path.
