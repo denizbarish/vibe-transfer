@@ -9,8 +9,8 @@ Bu liste gerçek `claude` binary'si ile, iki gerçek Mac üzerinde ya da aynı M
 ## 0. Hazırlık
 
 - [ ] Kaynakta Claude Code girişli ve en az 5 oturum, auto memory'si olan bir proje ve bir git remote'lu proje var.
-  Komut: `ls ~/.claude/projects | wc -l`
-  Beklenen: 1 veya daha büyük bir sayı.
+  Komut: `find ~/.claude/projects -mindepth 2 -maxdepth 2 -name '*.jsonl' | wc -l`
+  Beklenen: 5 veya daha büyük bir sayı. Auto memory'li proje (`~/.claude/projects/<slug>/memory/` var) ve git remote'lu proje elle doğrulanır.
 - [ ] Hedef hesapta Claude Code kurulu ama girişsiz (temiz hedef).
   Komut: `security find-generic-password -s "Claude Code-credentials" -a bob`
   Beklenen: `The specified item could not be found in the keychain.` ve çıkış kodu 44.

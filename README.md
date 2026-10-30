@@ -9,9 +9,9 @@ vibe-transfer, bir AI kodlama aracının hafızasını, ayarlarını ve sırlar�
 ### Ne yapar
 
 - `scan` ile kaynakta neyin taşınacağını gösterir. Hiçbir şey yazmaz; düz metin sır içeren dosyaları değerleri göstermeden listeler.
-- `export` ile seçilen verileri tek bir şifreli paket dosyasına yazar: oturum geçmişi, hafıza, ayarlar ve ajanlar, sırlar (Keychain'deki Claude giriş kaydı), proje içi AI dosyaları ve isteğe bağlı önbellek.
+- `export` ile seçilen verileri tek bir şifreli paket dosyasına yazar: oturum geçmişi, hafıza, ayarlar ve ajanlar, sırlar (Keychain'deki Claude giriş kaydı), proje içi AI dosyaları ve isteğe bağlı önbellek. Bilinen Claude Code kullanıcı dosyaları (`output-styles/`, `rules/`, `keybindings.json` ve `settings.json`'un durum satırı için çalıştırdığı `~/.claude` altındaki betik) ayarlarla birlikte taşınır. Listede olmayan öğeler önbellek sayılır ve yalnız `--include-optional` ile alınır; `settings.json`'un çalıştırdığı bir dosya aktarılmıyorsa bir not yazılır.
 - `import` ile paketi hedefe uygular. Projeleri hedefteki klasörleriyle eşler, eşlenemeyenleri bekleme alanına koyar, her yerleştirilen dosyayı doğrular ve bir rapor yazar.
-- Hedefte hiçbir şey silinmez: değişen veya kaldırılan her dosya `~/.vibe-transfer/backups/<oturum>/` altına taşınır ve `rollback` ile geri alınabilir.
+- İçe aktarma, bağlama ve geri alma hedefte hiçbir şey silmez: değişen veya kaldırılan her dosya `~/.vibe-transfer/backups/<oturum>/` altına taşınır ve `rollback` ile geri alınabilir. Tek istisna `pending --orphans`: bekleme alanında hiçbir kaydın sahiplenmediği dosyaları, terminalde onay verirseniz yedeksiz siler.
 - Kaynakta hiçbir dosya değiştirilmez. Tek istisna, kullanıcının elle çalıştırdığı `logout-source` komutudur.
 - Dosyaların değiştirilme zamanı (mtime) ve POSIX izinleri korunur.
 
@@ -24,6 +24,8 @@ vibe-transfer, bir AI kodlama aracının hafızasını, ayarlarını ve sırlar�
 - Paket dosyasını ve parolayı farklı kanallardan gönderin. Örneğin dosyayı bir USB bellekle, parolayı başka bir mesajlaşma kanalıyla iletin.
 - Sır sınıfı öğeler (Keychain kaydı) diske hiçbir zaman düz metin yazılmaz; yalnız bellekte ve şifreli paketin içinde bulunur, hedefte doğrudan Keychain'e yazılır.
 - Kaynakta zaten düz metin duran ve sır içerebilen dosyalar (oturum kayıtları, geçmiş, `settings.json`) paketin içinde şifreli taşınır ve hedefe kaynaktaki haliyle yazılır. `scan` bu dosyaları listeler.
+- Hedefte yazılan Keychain kaydının erişim listesi `/usr/bin/security`'ye (Claude Code kaydı bu araçla okur) ve vibe-transfer binary'sine güvenir.
+- Yalnız kendi oluşturduğunuz paketleri içe aktarın. Bir paket `~/.claude` altına kanca (hook) betikleri ve bunları çalıştıran ayarlar kurabilir; Claude Code bu betikleri sizin hesabınızla çalıştırır.
 
 ### Kurulum
 
@@ -33,7 +35,7 @@ Kaynaktan derleme (Rust 1.98.1 veya üstü gerekir):
 cargo install --locked --git https://github.com/denizbarish/vibe-transfer vt-cli
 ```
 
-Bu, `vibe-transfer` komutunu kurar. Binary imzasızdır. İmzasız bir binary'yi indirip kullanıyorsanız macOS Gatekeeper engelini kaldırmak için:
+Bu, `vibe-transfer` komutunu kurar. `cargo install` ile derlenen binary için başka adım gerekmez. Bir yayın binary'si yayımlanırsa imzasız olacaktır; onu indirip kullanıyorsanız macOS Gatekeeper engelini kaldırmak için:
 
 ```sh
 xattr -d com.apple.quarantine ./vibe-transfer
@@ -106,6 +108,7 @@ Claude Code'un yenileme token'ı tek kullanımlıktır; aynı token iki makinede
 - Hedefte Keychain'e ilk erişimde macOS bir kez izin penceresi gösterebilir.
 - `rollback`'in sır adımı için: hedefteki önceki değeri geri koymak paket parolasını, içe aktarmadan sonra değişmiş bir kaydı (ör. yenilenmiş token) geri almak ise terminalde onay gerektirir. Bunlar yoksa dosyalar geri alınır, sır adımı bekler ve komut tekrar çalıştırılmalıdır.
 - Bir projede `.Claude` gibi `.claude` ile yalnız büyük/küçük harf veya Unicode biçimi farklı olan bir klasör atlanır ve bunun için bir not yazılır.
+- Bir içe aktarmayı `rollback` ile geri almak, o içe aktarmanın bekleme alanına koyduğu kayıtları kaldırmaz. Bunlar `pending` listesinde kalır; `link` ile bağlanabilir.
 
 ### Lisans
 
@@ -118,9 +121,9 @@ vibe-transfer moves an AI coding tool's memory, settings and secrets from one ma
 ### What it does
 
 - `scan` shows what would move from the source. It writes nothing; it lists files that hold plaintext secrets without showing the values.
-- `export` writes the selected data into one encrypted bundle file: session history, memory, settings and agents, secrets (the Claude login item in the Keychain), project AI files and an optional cache.
+- `export` writes the selected data into one encrypted bundle file: session history, memory, settings and agents, secrets (the Claude login item in the Keychain), project AI files and an optional cache. Known Claude Code user files (`output-styles/`, `rules/`, `keybindings.json` and the script under `~/.claude` that `settings.json` runs for the status line) move with the settings. Unlisted items count as cache and are taken only with `--include-optional`; a note is written when a file that `settings.json` runs is not transferred.
 - `import` applies the bundle on the target. It maps projects to their folders on the target, puts unmatched ones in a pending area, verifies every placed file and writes a report.
-- Nothing is deleted on the target: every changed or removed file moves to `~/.vibe-transfer/backups/<session>/` and `rollback` can undo the session.
+- Import, link and rollback delete nothing on the target: every changed or removed file moves to `~/.vibe-transfer/backups/<session>/` and `rollback` can undo the session. The one exception is `pending --orphans`: after you confirm on a terminal, it deletes the files in the pending area that no record owns, without a backup.
 - No file on the source is changed. The one exception is `logout-source`, which you run by hand.
 - File modification times (mtime) and POSIX modes are kept.
 
@@ -133,6 +136,8 @@ Working data lives in `~/.vibe-transfer/` (session journals, reports, backups, t
 - Send the bundle file and the passphrase over different channels. For example, move the file on a USB drive and send the passphrase through another messaging channel.
 - Secret items (the Keychain item) are never written to disk in plaintext. They exist only in memory and inside the encrypted bundle, and are written straight to the Keychain on the target.
 - Files that already sit on the source in plaintext and may hold secrets (session logs, history, `settings.json`) travel encrypted inside the bundle and are written on the target as they were on the source. `scan` lists these files.
+- The access list of the Keychain item written on the target trusts `/usr/bin/security` (Claude Code reads the item through it) and the vibe-transfer binary.
+- Import only bundles you created yourself. A bundle can install hook scripts under `~/.claude` and the settings that run them; Claude Code runs those scripts as your account.
 
 ### Install
 
@@ -142,7 +147,7 @@ Build from source (needs Rust 1.98.1 or later):
 cargo install --locked --git https://github.com/denizbarish/vibe-transfer vt-cli
 ```
 
-This installs the `vibe-transfer` command. The binary is not signed. If you download and use an unsigned binary, remove the macOS Gatekeeper quarantine first:
+This installs the `vibe-transfer` command. A binary built with `cargo install` needs no further step. If a release binary is published, it will be unsigned; if you download and use it, remove the macOS Gatekeeper quarantine first:
 
 ```sh
 xattr -d com.apple.quarantine ./vibe-transfer
@@ -215,6 +220,7 @@ The Claude Code refresh token is single use; if the same token is used on two ma
 - The first Keychain access on the target may show one macOS permission prompt.
 - The secret step of `rollback`: restoring a previous value on the target needs the bundle passphrase, and undoing an item that changed after the import (for example a refreshed token) needs confirmation on a terminal. Without them the files are rolled back, the secret step stays pending and the command must be run again.
 - A project folder such as `.Claude`, which differs from `.claude` only in case or Unicode form, is skipped and a note is written for it.
+- Rolling back an import with `rollback` does not remove the pending records that import created. They stay in the `pending` list and can still be linked with `link`.
 
 ### License
 
