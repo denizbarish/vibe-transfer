@@ -281,10 +281,14 @@ impl PendingStore {
     }
 
     /// Moves the pending data of `id` into `into` (created owner-only), for
-    /// `restore` to bring back.
+    /// `restore` to bring back. The record is rewritten with relative blob
+    /// paths first, so the moved folder stays readable.
     pub fn archive(&self, id: &ProjectId, into: &Path) -> Result<()> {
-        self.take(id)?;
+        let project = self.take(id)?;
         let project_dir = self.project_dir(id);
+        // Older records hold absolute blob paths, which break once the
+        // folder moves: store the relative form first.
+        write_json_atomic(&project_dir, &project, &nonce_hex())?;
         create_private_dir_all(into)
             .with_context(|| format!("oluşturulamadı: {}", into.display()))?;
         let name = project_dir
@@ -781,6 +785,30 @@ mod tests {
         assert_eq!(fs::read(&taken.items[0].blob).unwrap(), b"a");
         // Nothing left to restore; a second run is harmless.
         assert!(store.restore(&archive).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_absolute_record_survives_archive_and_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PendingStore {
+            dir: tmp.path().join("pending"),
+        };
+        store.put(&project(), &[item(tmp.path(), 0, b"a")]).unwrap();
+        let project_dir = store.project_dir(&project().id);
+        let mut record = raw_record(&store);
+        let rel = record["items"][0]["blob"].as_str().unwrap().to_owned();
+        record["items"][0]["blob"] = project_dir.join(&rel).to_str().unwrap().into();
+        fs::write(project_dir.join(PENDING_JSON), record.to_string()).unwrap();
+
+        let archive = tmp.path().join("archive");
+        store.archive(&project().id, &archive).unwrap();
+        assert_eq!(store.restore(&archive).unwrap(), vec![project().id]);
+        let taken = store.take(&project().id).unwrap();
+        assert_eq!(fs::read(&taken.items[0].blob).unwrap(), b"a");
+        assert_eq!(
+            raw_record(&store)["items"][0]["blob"].as_str().unwrap(),
+            rel
+        );
     }
 
     #[test]
