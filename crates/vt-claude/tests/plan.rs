@@ -894,3 +894,39 @@ fn claude_dir_entry_naming_the_claude_json_is_refused() {
         );
     }
 }
+
+#[test]
+fn untransferred_claude_json_keys_are_listed_by_name_only() {
+    let fx = fx();
+    let doc = serde_json::json!({
+        "projects": {},
+        "userID": "synthetic-user-id-value",
+        "numStartups": 7,
+        "oauthAccount": {"accountUuid": "uuid-a"},
+    });
+    let rb = bundle(
+        &fx,
+        vec![file(
+            &fx,
+            0,
+            RootKind::ClaudeJson,
+            "",
+            doc.to_string().as_bytes(),
+        )],
+        Vec::new(),
+    );
+    let p = plan(&fx, &rb, &BTreeMap::new()).unwrap();
+    let hits: Vec<&(String, String)> = p
+        .skipped
+        .iter()
+        .filter(|(k, _)| k == "claude_json:")
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", p.skipped);
+    let reason = &hits[0].1;
+    for name in ["numStartups", "oauthAccount", "userID"] {
+        assert!(reason.contains(name), "{reason}");
+    }
+    assert!(!reason.contains("projects"), "{reason}");
+    assert!(!reason.contains("synthetic-user-id-value"), "{reason}");
+    assert!(!reason.contains("uuid-a"), "{reason}");
+}

@@ -12,6 +12,7 @@ use vt_core::scan::{NON_UTF8_NAME, NON_UTF8_TARGET, RawEntry, scan_tree, stat_en
 
 use crate::ClaudeAdapter;
 use crate::projects::{ProjectScanOptions, UNREADABLE, fold, scan_project, unreadable_dir};
+use crate::settings_refs::settings_refs;
 
 const UNSELECTED: &str = "kullanıcı seçimiyle atlandı";
 const NEVER: &str = "asla taşınmaz: makineye özgü";
@@ -24,6 +25,10 @@ const MISSING_PROJECT: &str = "proje klasörü bu makinede yok";
 const STALE_CLAUDE_DIR: &str =
     "eski Claude klasörü, CLAUDE_CONFIG_DIR başka yeri gösteriyor; proje verisi olarak aktarılmadı";
 const INSIDE_CLAUDE_DIR: &str = "Claude klasörünün içinde, ayrıca taşınmaz";
+const STALE_HOME_CLAUDE_DIR: &str = "CLAUDE_CONFIG_DIR başka yeri gösteriyor; bu klasörün \
+     içeriği aktarılmadı, ne olacağına siz karar verin";
+const REFERENCED_NOT_MOVED: &str =
+    "settings.json bu dosyayı çalıştırıyor ama dosya aktarılmıyor; hedefte eksik kalır";
 
 /// Everything the Claude adapter would transfer for a selection.
 ///
@@ -109,7 +114,8 @@ fn rule(rel: &str) -> Rule {
             item(Transfer, Sessions)
         }
         "CLAUDE.md" | "agents" | "commands" | "skills" | "hooks" | "scripts" | "bin" | "docs"
-        | "references" => item(Transfer, Settings),
+        | "references" | "output-styles" | "rules" => item(Transfer, Settings),
+        "keybindings.json" if parts.len() == 1 => item(Transfer, Settings),
         _ if parts.len() == 1 && first.starts_with("settings") && first.ends_with(".json") => {
             item(Transfer, Settings)
         }
@@ -173,6 +179,32 @@ fn is_never(parts: &[&str]) -> bool {
         || (fold(first) == ".claude" && second.is_some_and(|s| fold(s) == "worktrees"))
 }
 
+/// `rule`, except that the status line script named in `settings.json`
+/// is settings, and the directories leading to it are containers so the
+/// script is reached even inside an unlisted folder.
+fn status_line_rule(rel: &str, status_line: &[String]) -> Rule {
+    let base = rule(rel);
+    for script in status_line {
+        if script == rel {
+            return item(Class::Transfer, Category::Settings);
+        }
+        let leads_to = script
+            .strip_prefix(rel)
+            .is_some_and(|rest| rest.starts_with('/'));
+        let included = matches!(
+            base,
+            Rule::Item {
+                class: Class::Transfer,
+                ..
+            }
+        );
+        if leads_to && !included {
+            return Rule::Container;
+        }
+    }
+    base
+}
+
 fn selected(sel: &Selection, category: Category) -> bool {
     sel.includes(Tool::Claude, category)
 }
@@ -226,6 +258,8 @@ impl ClaudeAdapter {
             notes: Vec::new(),
         };
 
+        // Files `settings.json` runs from the Claude dir.
+        let refs = settings_refs(&env.claude_dir, &env.home);
         if env.claude_dir.is_dir() {
             // With CLAUDE_CONFIG_DIR, `.claude.json` sits inside the Claude dir
             // but is inventoried as its own root.
@@ -244,9 +278,24 @@ impl ClaudeAdapter {
                 // the export emits exactly what the import accepts.
                 match classify_folded(rel) {
                     Some((Class::Never, category)) => decide(item(Class::Never, category), sel),
-                    _ => decide(rule(rel), sel),
+                    _ => decide(status_line_rule(rel, &refs.status_line), sel),
                 }
             });
+        }
+        // With CLAUDE_CONFIG_DIR elsewhere, an existing `~/.claude` is left
+        // as it is; say so, since it may hold data the user still wants.
+        let home_claude = env.home.join(".claude");
+        if env.claude_config_dir_override.is_some()
+            && fs::symlink_metadata(&home_claude).is_ok()
+            && !same_path(&home_claude, &env.claude_dir)
+        {
+            c.notes.push((
+                home_claude.display().to_string(),
+                format!(
+                    "{STALE_HOME_CLAUDE_DIR} (CLAUDE_CONFIG_DIR: {})",
+                    env.claude_dir.display()
+                ),
+            ));
         }
 
         let projects = self.collect_projects()?;
@@ -273,6 +322,24 @@ impl ClaudeAdapter {
                 .map(|p| Path::new(&p.old_path))
                 .collect();
             c.add_project(project, env, &others);
+        }
+
+        // A settings.json that moves while a file it runs stays behind.
+        let moved = |rel: &str| {
+            c.entries
+                .iter()
+                .any(|(e, _)| e.root == RootKind::ClaudeDir && e.rel == rel)
+        };
+        if moved("settings.json") {
+            let missing: Vec<String> = refs
+                .all
+                .iter()
+                .filter(|rel| !moved(rel) && fs::symlink_metadata(env.claude_dir.join(rel)).is_ok())
+                .cloned()
+                .collect();
+            for rel in missing {
+                c.notes.push((rel, REFERENCED_NOT_MOVED.to_owned()));
+            }
         }
 
         let mut entries = c.entries;

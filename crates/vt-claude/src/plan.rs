@@ -29,7 +29,9 @@ use vt_core::scan::hash_file;
 
 use crate::claude_json::read_claude_json_stable;
 use crate::inventory::classify_folded;
-use crate::merge::{merge_claude_json, merge_json_settings, merge_memory_md};
+use crate::merge::{
+    claude_json_untransferred_keys, merge_claude_json, merge_json_settings, merge_memory_md,
+};
 use crate::projects::{first_cwds, fold, is_project_entry_shape};
 use crate::transform::{memory_slug_for, rewrite_json_paths, rewrite_path_value, target_slug_dir};
 
@@ -976,6 +978,16 @@ impl Builder<'_> {
             Ok(_) => read_claude_json_stable(&path)?,
             Err(_) => Value::Null,
         };
+        let left_out = claude_json_untransferred_keys(&src, self.input.take_oauth);
+        if !left_out.is_empty() {
+            self.out.skipped.push((
+                "claude_json:".to_owned(),
+                format!(
+                    "aktarılmayan üst düzey anahtarlar (yalnız adlar): {}",
+                    left_out.join(", ")
+                ),
+            ));
+        }
         let mut merged = original.clone();
         let conflicts = merge_claude_json(&mut merged, &src, self.input.take_oauth);
         for c in conflicts {

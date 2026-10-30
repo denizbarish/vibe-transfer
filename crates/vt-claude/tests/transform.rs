@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
 use vt_claude::{
-    CLAUDE_REWRITE_JSONL_CWD, memory_slug_for, merge_claude_json, merge_memory_md,
-    rewrite_json_paths, rewrite_jsonl_cwd, target_slug_dir,
+    CLAUDE_REWRITE_JSONL_CWD, claude_json_untransferred_keys, memory_slug_for, merge_claude_json,
+    merge_memory_md, rewrite_json_paths, rewrite_jsonl_cwd, target_slug_dir,
 };
 use vt_core::pathcodec::claude_slug;
 
@@ -368,4 +368,21 @@ fn rewrite_jsonl_cwd_only_cwd_field() {
     assert_eq!(rewrite_jsonl_cwd(r#"{"type":"summary"}"#, &mapper), None);
     assert_eq!(rewrite_jsonl_cwd(r#"{"cwd":3}"#, &mapper), None);
     assert_eq!(rewrite_jsonl_cwd("not json", &mapper), None);
+}
+
+#[test]
+fn claude_json_untransferred_keys_follow_the_merge_rules() {
+    let source = serde_json::json!({
+        "projects": {}, "mcpServers": {}, "githubRepoPaths": {},
+        "oauthAccount": {}, "userID": "x", "cachedThing": 1,
+    });
+    assert_eq!(
+        claude_json_untransferred_keys(&source, false),
+        vec!["cachedThing", "oauthAccount", "userID"]
+    );
+    assert_eq!(
+        claude_json_untransferred_keys(&source, true),
+        vec!["cachedThing", "userID"]
+    );
+    assert!(claude_json_untransferred_keys(&serde_json::Value::Null, false).is_empty());
 }

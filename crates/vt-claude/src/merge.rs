@@ -60,6 +60,24 @@ pub fn merge_claude_json(
     conflicts
 }
 
+/// Top-level keys of a source `~/.claude.json` that `merge_claude_json`
+/// leaves out (identity, caches, counters, and `oauthAccount` unless taken),
+/// sorted. Names only: the values may be identifying.
+pub fn claude_json_untransferred_keys(source: &Value, take_oauth_account: bool) -> Vec<String> {
+    let Value::Object(src) = source else {
+        return Vec::new();
+    };
+    src.keys()
+        .filter(|k| {
+            let k = k.as_str();
+            !ENTRY_MERGED_KEYS.contains(&k)
+                && k != REPO_PATHS_KEY
+                && !(take_oauth_account && k == OAUTH_ACCOUNT_KEY)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Merges the object `src_value` into `dst[key]` entry by entry. When an
 /// entry differs, `combine` may produce a merged value; otherwise the entry
 /// is a conflict. A non-object on either side is a conflict on `key` itself.

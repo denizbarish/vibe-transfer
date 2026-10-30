@@ -124,6 +124,9 @@ fn classify_table() {
             Some((Transfer, Settings)),
         ),
         ("plugins/data/demo-mkt/state.db", Some((Transfer, Settings))),
+        ("output-styles/terse.md", Some((Transfer, Settings))),
+        ("keybindings.json", Some((Transfer, Settings))),
+        ("rules/style.md", Some((Transfer, Settings))),
         // Optional
         ("backups/.claude.json.backup.1", Some((Optional, Cache))),
         ("cache/changelog.md", Some((Optional, Cache))),
@@ -780,4 +783,81 @@ fn project_claude_full_case_fold_variants_are_dropped() {
         let reason = skip_reason(&inv, &format!("project:{id}:{top}")).unwrap_or_default();
         assert!(reason.contains("makineye"), "{rel}: {:?}", inv.skipped);
     }
+}
+
+#[test]
+fn status_line_script_is_settings_and_skipped_references_are_noted() {
+    let (_tmp, env) = setup();
+    let claude = env.home.join(".claude");
+    fs::create_dir_all(claude.join("statusline")).unwrap();
+    fs::write(claude.join("statusline/line.sh"), "#!/bin/sh\n").unwrap();
+    fs::write(claude.join("statusline/other.txt"), "x").unwrap();
+    fs::create_dir_all(claude.join("tools")).unwrap();
+    fs::write(claude.join("tools/run.sh"), "#!/bin/sh\n").unwrap();
+    fs::write(claude.join("keybindings.json"), "{}").unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        serde_json::json!({
+            "statusLine": {"type": "command", "command": "bash ~/.claude/statusline/line.sh"},
+            "hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "\"$HOME/.claude/tools/run.sh\" --quiet"}
+            ]}]},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let inv = ClaudeAdapter { env: env.clone() }
+        .inventory(&selection(DEFAULT))
+        .unwrap();
+    let got = rels(&inv, &RootKind::ClaudeDir);
+    for want in ["statusline/line.sh", "keybindings.json"] {
+        assert!(got.iter().any(|r| r == want), "{want}: {got:?}");
+    }
+    let line = inv
+        .entries
+        .iter()
+        .find(|(e, _)| e.rel == "statusline/line.sh")
+        .unwrap();
+    assert_eq!(line.0.category, Category::Settings);
+    // Its unlisted neighbour stays optional cache, left out here.
+    assert!(!got.iter().any(|r| r == "statusline/other.txt"), "{got:?}");
+    // A hook script the selection leaves out is noted.
+    assert!(!got.iter().any(|r| r.starts_with("tools")), "{got:?}");
+    let note = inv
+        .notes
+        .iter()
+        .find(|(k, _)| k == "tools/run.sh")
+        .map(|(_, r)| r.clone());
+    assert!(
+        note.as_deref().is_some_and(|n| n.contains("settings.json")),
+        "{:?}",
+        inv.notes
+    );
+}
+
+#[test]
+fn stale_home_claude_dir_is_noted_even_when_home_is_no_project() {
+    let (_tmp, base) = setup();
+    let home = base.home.clone();
+    let cfg = home.join("cfg");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join(".claude.json"), "{}").unwrap();
+    let env = VtEnv::new(home.clone(), "alice".into(), Some(cfg));
+    let inv = ClaudeAdapter { env }
+        .inventory(&selection(DEFAULT))
+        .unwrap();
+    let stale = home.join(".claude");
+    let note = inv
+        .notes
+        .iter()
+        .find(|(k, _)| k == stale.to_str().unwrap())
+        .map(|(_, r)| r.clone())
+        .unwrap_or_default();
+    assert!(note.contains("CLAUDE_CONFIG_DIR"), "{:?}", inv.notes);
+    // Its contents are not transferred.
+    assert!(
+        !inv.entries.iter().any(|(_, p)| p.starts_with(&stale)),
+        "{:?}",
+        inv.entries
+    );
 }
