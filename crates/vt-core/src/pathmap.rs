@@ -96,7 +96,8 @@ pub enum Mapping {
 }
 
 /// Applies the matching rules of spec 7 in order. `r.remote` is already
-/// normalized (see `ProjectRef`).
+/// normalized (see `ProjectRef`). A path under the source home maps to the
+/// same place under `dst_home` only when that folder exists there.
 pub fn map_project(r: &ProjectRef, idx: &TargetIndex, src_home: &str, dst_home: &Path) -> Mapping {
     if let Some(remote) = &r.remote {
         return match idx.by_remote.get(remote).map(Vec::as_slice) {
@@ -114,11 +115,18 @@ pub fn map_project(r: &ProjectRef, idx: &TargetIndex, src_home: &str, dst_home: 
     }
     if let Some(rest) = usable_home(src_home).and_then(|home| strip_home(&r.old_path, home)) {
         let rest = rest.trim_start_matches('/');
-        return Mapping::Auto(if rest.is_empty() {
+        let path = if rest.is_empty() {
             dst_home.to_path_buf()
         } else {
             dst_home.join(rest)
-        });
+        };
+        // The plan never creates a project folder (spec 3, 7): a folder
+        // missing here waits in the pending store until `link`.
+        return if path.is_dir() {
+            Mapping::Auto(path)
+        } else {
+            Mapping::Pending
+        };
     }
     if old.is_dir() {
         return Mapping::Auto(old.to_path_buf());

@@ -89,35 +89,45 @@ fn map_git_without_remote_pending() {
 #[test]
 fn map_home_non_git_auto_rewrite() {
     let idx = TargetIndex::default();
+    let tmp = tempfile::tempdir().unwrap();
+    let dst = tmp.path().join("dst");
+    fs::create_dir_all(dst.join("Desktop/notes")).unwrap();
     let r = plain_ref("/Users/src/Desktop/notes");
     assert_eq!(
-        map_project(&r, &idx, "/Users/src", Path::new("/Users/dst")),
-        Mapping::Auto(PathBuf::from("/Users/dst/Desktop/notes"))
+        map_project(&r, &idx, "/Users/src", &dst),
+        Mapping::Auto(dst.join("Desktop/notes"))
     );
     // A trailing slash on src_home makes no difference; home itself maps too.
     assert_eq!(
-        map_project(&r, &idx, "/Users/src/", Path::new("/Users/dst")),
-        Mapping::Auto(PathBuf::from("/Users/dst/Desktop/notes"))
+        map_project(&r, &idx, "/Users/src/", &dst),
+        Mapping::Auto(dst.join("Desktop/notes"))
     );
     assert_eq!(
-        map_project(
-            &plain_ref("/Users/src"),
-            &idx,
-            "/Users/src",
-            Path::new("/Users/dst")
-        ),
-        Mapping::Auto(PathBuf::from("/Users/dst"))
+        map_project(&plain_ref("/Users/src"), &idx, "/Users/src", &dst),
+        Mapping::Auto(dst.clone())
     );
     // A sibling sharing the prefix is not under home.
     assert_eq!(
-        map_project(
-            &plain_ref("/Users/src2/notes"),
-            &idx,
-            "/Users/src",
-            Path::new("/Users/dst")
-        ),
+        map_project(&plain_ref("/Users/src2/notes"), &idx, "/Users/src", &dst),
         Mapping::Pending
     );
+}
+
+#[test]
+fn map_home_non_git_missing_on_target_is_pending() {
+    // Spec 3 and 7: the plan never creates a project folder on the target,
+    // so a rewritten path that does not exist waits for `link`.
+    let tmp = tempfile::tempdir().unwrap();
+    let dst = tmp.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(dst.join("file"), "x").unwrap();
+    for old in ["/Users/src/Desktop/notes", "/Users/src/file"] {
+        assert_eq!(
+            map_project(&plain_ref(old), &TargetIndex::default(), "/Users/src", &dst),
+            Mapping::Pending,
+            "old_path={old}"
+        );
+    }
 }
 
 #[test]
