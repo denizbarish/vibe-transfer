@@ -373,3 +373,66 @@ fn symlink_into_a_project_follows_the_project_mapping() {
     assert_eq!(target(1), format!("{home}/tools/y"));
     assert_eq!(target(2), "../shared/z");
 }
+
+#[test]
+fn case_and_normalization_variants_of_denied_names_are_rejected() {
+    let fx = fx();
+    let (id, project, mappings) = app_project(&fx);
+    let root = RootKind::Project(id);
+    for rel in [
+        ".claude/WORKTREES/x.md",
+        ".claude/Worktrees/x.md",
+        ".Claude/settings.json",
+        ".CLAUDE/agents/r.md",
+        ".GIT/CLAUDE.md",
+        "Node_Modules/x/CLAUDE.md",
+    ] {
+        let rb = bundle(
+            &fx,
+            vec![file(&fx, 0, root.clone(), rel, b"x")],
+            vec![project.clone()],
+        );
+        let err = plan(&fx, &rb, &mappings).unwrap_err();
+        assert!(format!("{err:#}").contains("reddedildi"), "{rel}: {err:#}");
+    }
+}
+
+#[test]
+fn home_mapped_project_never_writes_into_the_live_claude_dir() {
+    let fx = fx();
+    let live = fx.env.claude_dir.join("settings.json");
+    fs::create_dir_all(&fx.env.claude_dir).unwrap();
+    fs::write(&live, b"{\"live\":true}").unwrap();
+    let id = ProjectId(format!("path:{}", "/Users/alice"));
+    let project = ProjectRef {
+        id: id.clone(),
+        old_path: "/Users/alice".into(),
+        remote: None,
+        is_git: false,
+    };
+    let root = RootKind::Project(id.clone());
+    let mut mappings = BTreeMap::new();
+    // The user approved the target home as this project's root.
+    mappings.insert(id, Mapping::Auto(fx.env.home.clone()));
+
+    for rel in [".claude/settings.json", ".claude"] {
+        let entry = if rel == ".claude" {
+            dir(0, root.clone(), rel)
+        } else {
+            file(&fx, 0, root.clone(), rel, b"{\"evil\":true}")
+        };
+        let rb = bundle(&fx, vec![entry], vec![project.clone()]);
+        let err = plan(&fx, &rb, &mappings).unwrap_err();
+        assert!(format!("{err:#}").contains("Claude klasörü"), "{err:#}");
+    }
+    assert_eq!(fs::read(&live).unwrap(), b"{\"live\":true}");
+
+    // Root-level files of the approved home project are planned normally.
+    let rb = bundle(
+        &fx,
+        vec![file(&fx, 0, root, "CLAUDE.md", b"# home\n")],
+        vec![project],
+    );
+    let p = plan(&fx, &rb, &mappings).unwrap();
+    assert_eq!(p.plan.placements[0].dest, fx.env.home.join("CLAUDE.md"));
+}

@@ -13,9 +13,10 @@ use serde_json::{Map, Value, json};
 use vt_claude::{
     ClaudePlan, PlanInput, PlanQuestions, build_claude_apply_plan, read_claude_json_stable,
 };
+use vt_core::VtEnv;
 use vt_core::apply::{self, ApplyPlan, ApplyReport, ConflictResolver, Decision, Resolution};
 use vt_core::bundle::{ReadBundle, SecretString, encrypt_to_file, read_bundle};
-use vt_core::fsutil::create_private_dir_all;
+use vt_core::fsutil::{create_private_dir_all, same_object};
 use vt_core::manifest::{JsonConflict, ProjectId, ProjectRef};
 use vt_core::pathmap::{Mapping, build_target_index, map_project};
 use vt_core::pending::PendingStore;
@@ -314,7 +315,7 @@ fn map_projects(
     let mut out = BTreeMap::new();
     for p in &rb.manifest.projects {
         let mapping = match map_project(p, &idx, src_home, &ctx.env.home) {
-            Mapping::Auto(path) if path == ctx.env.home || path == Path::new("/") => {
+            Mapping::Auto(path) if needs_confirmation(&path, &ctx.env) => {
                 match prompter.choose_path(p, std::slice::from_ref(&path))? {
                     Some(path) => Mapping::Auto(path),
                     None => Mapping::Pending,
@@ -329,6 +330,17 @@ fn map_projects(
         out.insert(p.id.clone(), mapping);
     }
     Ok(out)
+}
+
+/// Whether an automatic mapping to `root` must be confirmed by the user:
+/// `root` is the target home or `/`, an ancestor of home, inside the
+/// Claude dir, or a folder whose `.claude` is the Claude dir. Compared by
+/// file identity, so case variants, firmlinks and symlinks count too.
+fn needs_confirmation(root: &Path, env: &VtEnv) -> bool {
+    same_object(root, Path::new("/"))
+        || env.home.ancestors().any(|a| same_object(root, a))
+        || root.ancestors().any(|a| same_object(a, &env.claude_dir))
+        || same_object(&root.join(".claude"), &env.claude_dir)
 }
 
 fn read_target_json(path: &Path) -> Result<Value> {

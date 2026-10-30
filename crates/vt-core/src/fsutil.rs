@@ -21,3 +21,31 @@ pub fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(path)
 }
+
+/// Device and inode of what `path` resolves to (symlinks followed);
+/// `None` when it does not exist or the platform has no such identity.
+pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Whether `a` and `b` are the same file system object however they are
+/// spelled (case variants, firmlinks, symlinks, trailing `/`). Falls back
+/// to comparing canonical paths, then the paths themselves.
+pub fn same_object(a: &Path, b: &Path) -> bool {
+    if let (Some(x), Some(y)) = (file_identity(a), file_identity(b)) {
+        return x == y;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}

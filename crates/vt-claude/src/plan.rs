@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 use vt_core::VtEnv;
 use vt_core::apply::{ApplyPlan, Decision, Placement, ReplaceScope, Resolution};
 use vt_core::bundle::ReadBundle;
-use vt_core::fsutil::create_private_file;
+use vt_core::fsutil::{create_private_file, same_object};
 use vt_core::manifest::{
     Class, Entry, EntryKind, JsonConflict, ProjectId, ProjectRef, RootKind, Tool,
 };
@@ -355,6 +355,16 @@ impl Builder<'_> {
     ) -> Result<()> {
         match self.mapping(id).cloned() {
             Some(root) => {
+                let in_dot_claude = e.rel == ".claude" || e.rel.starts_with(".claude/");
+                if in_dot_claude && dot_claude_is_claude_dir(&root, &self.env.claude_dir) {
+                    bail!(
+                        "{} projesinin .claude klasörü hedefin Claude klasörü ({}); proje \
+                         içindeki .claude öğeleri oraya yazılmaz: {:?}; içe aktarma reddedildi",
+                        id.0,
+                        self.env.claude_dir.display(),
+                        e.rel
+                    );
+                }
                 let owner = Owner::Project(id.clone(), root.clone());
                 self.entry(&owner, &root, e, &e.rel, project_rule(&e.rel), q)
             }
@@ -992,6 +1002,23 @@ fn safe_join(base: &Path, rel: &str, need_name: bool) -> Result<PathBuf> {
         bail!("geçersiz kayıt yolu, hedef kökünün dışına çıkabilir: {rel:?}");
     }
     Ok(joined)
+}
+
+/// Whether `<root>/.claude` is (or would be) the live Claude dir: same
+/// object when both exist, or `root` is the Claude dir's parent and the
+/// Claude dir is named `.claude` (any case).
+fn dot_claude_is_claude_dir(root: &Path, claude_dir: &Path) -> bool {
+    if same_object(&root.join(".claude"), claude_dir) {
+        return true;
+    }
+    let named = claude_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(".claude"));
+    named
+        && claude_dir
+            .parent()
+            .is_some_and(|parent| same_object(root, parent))
 }
 
 /// A target project root must be absolute and free of `..`.

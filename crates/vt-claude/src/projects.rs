@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::Value;
+use unicode_normalization::UnicodeNormalization;
 use vt_core::manifest::{EntryKind, ProjectId, ProjectRef};
 use vt_core::remote::{normalize_remote, read_origin};
 use vt_core::scan::{ScanResult, scan_tree};
@@ -283,19 +284,32 @@ pub fn project_inner_files(project_root: &Path) -> Vec<String> {
 /// other project path a bundle may carry (e.g. `.bashrc`, `.git/hooks/*`).
 pub(crate) fn is_project_entry_shape(rel: &str, kind: &EntryKind) -> bool {
     let parts: Vec<&str> = rel.split('/').collect();
-    if parts[0] == ".claude" {
-        return parts.get(1) != Some(&"worktrees");
+    // Denied names are matched case- and normalization-insensitively (APFS
+    // folds both); allowed names must match exactly.
+    if fold(parts[0]) == ".claude" {
+        return parts[0] == ".claude"
+            && parts
+                .get(1)
+                .is_none_or(|second| fold(second) != "worktrees");
     }
     let (dirs, name) = parts.split_at(parts.len() - 1);
     let name = name[0];
     let dirs_ok = |dirs: &[&str]| {
-        dirs.len() <= NESTED_CLAUDE_MD_DEPTH && !dirs.iter().any(|d| PRUNED_DIRS.contains(d))
+        dirs.len() <= NESTED_CLAUDE_MD_DEPTH
+            && !dirs
+                .iter()
+                .any(|d| PRUNED_DIRS.iter().any(|p| fold(d) == fold(p)))
     };
     match kind {
         EntryKind::Dir => dirs_ok(&parts),
         _ if parts.len() == 1 => ROOT_FILES.contains(&name),
         _ => name == "CLAUDE.md" && dirs_ok(dirs),
     }
+}
+
+/// NFC and lowercase: how a case-insensitive file system compares names.
+fn fold(name: &str) -> String {
+    name.nfc().collect::<String>().to_lowercase()
 }
 
 /// How [`scan_project`] walks one project.

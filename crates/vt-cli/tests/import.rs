@@ -757,3 +757,54 @@ fn import_kept_account_without_target_item_moves_mcp_oauth() {
     assert!(!text(&i.output.stdout).contains("logout-source"));
     no_leaks(&fx, &i, &[fake_token("src"), "synthetic-mcp-value".into()]);
 }
+
+/// Exports a source with one more session opened in `cwd` and imports it
+/// without answers: the mapping of that path must be asked, not guessed.
+fn assert_mapping_is_asked(fx: &Fx, cwd: &Path) {
+    let slug = fx
+        .src
+        .join(".claude/projects")
+        .join(claude_slug(cwd.to_str().unwrap()));
+    write(
+        &slug.join("sess-x.jsonl"),
+        &format!(
+            "{}\n",
+            json!({"type": "user", "cwd": cwd, "sessionId": "sess-x"})
+        ),
+    );
+    let bundle = export(fx);
+    let i = import(fx, &bundle, None, None);
+    let stderr = text(&i.output.stderr);
+    assert!(
+        !i.output.status.success(),
+        "{cwd:?} mapped silently:\n{stderr}"
+    );
+    assert!(stderr.contains("terminal"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("path:{}", cwd.display())),
+        "{stderr}"
+    );
+    assert!(!fx.dst.join(".claude").exists());
+}
+
+#[test]
+fn import_asks_for_case_variant_of_target_home() {
+    let fx = setup();
+    let parent = fx.dst.parent().unwrap();
+    let variant = parent.join("DST");
+    // Runtime probe: only a case-insensitive file system resolves the variant.
+    if fs::metadata(&variant).is_err() {
+        println!("SKIPPED: case-sensitive file system, no case variant of the home exists");
+        return;
+    }
+    assert_mapping_is_asked(&fx, &variant);
+}
+
+#[test]
+fn import_asks_for_root_and_home_ancestor() {
+    let fx = setup();
+    assert_mapping_is_asked(&fx, Path::new("/"));
+    let fx = setup();
+    let ancestor = fx.dst.parent().unwrap().to_path_buf();
+    assert_mapping_is_asked(&fx, &ancestor);
+}
