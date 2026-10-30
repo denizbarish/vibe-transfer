@@ -450,6 +450,9 @@ fn never_class_names_in_project_claude_dir_are_rejected() {
         ".claude/scheduled_tasks.lock",
         ".claude/.claude.json.tmp.1",
         &format!(".claude/.credential{}.json", '\u{17F}'),
+        &format!(".claude/se{}ions/x", '\u{DF}'),
+        &format!(".claude/se{}ion-env", '\u{1E9E}'),
+        &format!(".claude/.la{}-cleanup", '\u{FB05}'),
     ] {
         let rb = bundle(
             &fx,
@@ -484,4 +487,88 @@ fn project_claude_user_content_is_accepted() {
         let p = plan(&fx, &rb, &mappings).unwrap_or_else(|e| panic!("{rel}: {e:#}"));
         assert_eq!(p.plan.placements.len(), 1, "{rel}");
     }
+}
+
+#[test]
+fn never_class_claude_dir_entries_reject_the_plan() {
+    let fx = fx();
+    for rel in [
+        ".credentials.json".to_owned(),
+        ".Credentials.json".to_owned(),
+        ".device-keys.json".to_owned(),
+        "sessions/1.json".to_owned(),
+        "Sessions/1.json".to_owned(),
+        format!("se{}ions/x", '\u{DF}'),
+        format!(".la{}-cleanup", '\u{FB06}'),
+        "tasks/t/.LOCK".to_owned(),
+    ] {
+        let rb = bundle(
+            &fx,
+            vec![
+                file(&fx, 0, RootKind::ClaudeDir, "agents/a.md", b"a"),
+                file(&fx, 1, RootKind::ClaudeDir, &rel, b"x"),
+            ],
+            Vec::new(),
+        );
+        let err = plan(&fx, &rb, &BTreeMap::new()).unwrap_err();
+        assert!(format!("{err:#}").contains("reddedildi"), "{rel}: {err:#}");
+        assert!(
+            fs::read_dir(&fx.env.home).unwrap().next().is_none(),
+            "{rel}"
+        );
+    }
+    // Ordinary Claude dir content still plans.
+    let rb = bundle(
+        &fx,
+        vec![
+            file(&fx, 0, RootKind::ClaudeDir, "agents/ağ-uzmanı.md", b"a"),
+            file(&fx, 1, RootKind::ClaudeDir, "tasks/t/plan.md", b"p"),
+        ],
+        Vec::new(),
+    );
+    assert_eq!(
+        plan(&fx, &rb, &BTreeMap::new())
+            .unwrap()
+            .plan
+            .placements
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn replace_keeps_case_variants_of_never_files_in_the_target() {
+    let fx = fx();
+    let lock = fx.env.claude_dir.join("tasks/t/.LOCK");
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(&lock, "1").unwrap();
+    fs::write(fx.env.claude_dir.join("tasks/t/old.md"), "old").unwrap();
+    let rb = bundle(
+        &fx,
+        vec![
+            dir(1, RootKind::ClaudeDir, "tasks"),
+            file(&fx, 0, RootKind::ClaudeDir, "tasks/u/plan.md", b"p"),
+        ],
+        Vec::new(),
+    );
+    let input = PlanInput {
+        mappings: &BTreeMap::new(),
+        decision: Decision::Replace,
+        take_oauth: false,
+        session_id: "t",
+        work_dir: &fx.work,
+    };
+    let p = build_claude_apply_plan(&rb, &fx.env, &input, &mut NoQuestions).unwrap();
+    let scope = p
+        .plan
+        .replace_scopes
+        .iter()
+        .find(|s| s.dir == fx.env.claude_dir.join("tasks"))
+        .expect("tasks scope");
+    assert!(scope.keep.contains(&lock), "{:?}", scope.keep);
+    assert!(
+        !scope
+            .keep
+            .contains(&fx.env.claude_dir.join("tasks/t/old.md"))
+    );
 }

@@ -742,3 +742,42 @@ fn project_claude_keeps_user_content_and_drops_machine_state() {
         assert!(reason.contains(word), "{rel}: {:?}", inv.skipped);
     }
 }
+
+#[test]
+fn project_claude_full_case_fold_variants_are_dropped() {
+    // APFS folds sharp s and the Latin ligatures to plain letters, so these
+    // open Claude's own `sessions`, `session-env` and `.last-cleanup`.
+    let (_tmp, env) = setup();
+    let app = env.home.join("code/app");
+    let variants = [
+        format!(".claude/se{}ions/x", '\u{DF}'),
+        format!(".claude/se{}ion-env", '\u{1E9E}'),
+        format!(".claude/.la{}-cleanup", '\u{FB05}'),
+    ];
+    for rel in variants
+        .iter()
+        .map(String::as_str)
+        .chain([".claude/agents/ağ-uzmanı.md"])
+    {
+        fs::create_dir_all(app.join(rel).parent().unwrap()).unwrap();
+        fs::write(app.join(rel), "x").unwrap();
+    }
+    let inv = ClaudeAdapter { env: env.clone() }
+        .inventory(&selection(DEFAULT))
+        .unwrap();
+    let id = "github.com/acme/app";
+    let app_rels = rels(&inv, &RootKind::Project(ProjectId(id.into())));
+    assert!(
+        app_rels.contains(&".claude/agents/ağ-uzmanı.md".to_owned()),
+        "{app_rels:?}"
+    );
+    for rel in &variants {
+        let top = rel.rsplit_once("/x").map_or(rel.as_str(), |(d, _)| d);
+        assert!(
+            !app_rels.iter().any(|r| r.starts_with(top)),
+            "{rel}: {app_rels:?}"
+        );
+        let reason = skip_reason(&inv, &format!("project:{id}:{top}")).unwrap_or_default();
+        assert!(reason.contains("makineye"), "{rel}: {:?}", inv.skipped);
+    }
+}

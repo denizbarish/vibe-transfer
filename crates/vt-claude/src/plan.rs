@@ -28,7 +28,7 @@ use vt_core::report::{TransformRecord, hash_bytes, json_bytes};
 use vt_core::scan::hash_file;
 
 use crate::claude_json::read_claude_json_stable;
-use crate::inventory::classify;
+use crate::inventory::classify_folded;
 use crate::merge::{merge_claude_json, merge_json_settings, merge_memory_md};
 use crate::projects::{first_cwds, is_project_entry_shape};
 use crate::transform::{memory_slug_for, rewrite_json_paths, rewrite_path_value, target_slug_dir};
@@ -136,6 +136,17 @@ pub fn build_claude_apply_plan(
     let m = &rb.manifest;
     for e in &m.entries {
         check_rel(e)?;
+        // Secrets and machine state never go into the Claude dir. The folded
+        // classifier also catches spellings a case-insensitive file system
+        // would open as the real name (`.Credentials.json`, `seßions`).
+        if e.root == RootKind::ClaudeDir
+            && classify_folded(&e.rel).is_some_and(|(class, _)| class == Class::Never)
+        {
+            bail!(
+                "paket, Claude klasörüne asla taşınmayan bir yol içeriyor: {:?}; içe aktarma reddedildi",
+                e.rel
+            );
+        }
         if let RootKind::Project(id) = &e.root
             && !is_project_entry_shape(&e.rel, &e.kind)
         {
@@ -852,7 +863,7 @@ impl Builder<'_> {
                     .strip_prefix(&claude_dir)
                     .ok()
                     .and_then(Path::to_str)
-                    .and_then(classify)
+                    .and_then(classify_folded)
                     .is_some_and(|(class, category)| {
                         class == Class::Never || !selection.includes(Tool::Claude, category)
                     });

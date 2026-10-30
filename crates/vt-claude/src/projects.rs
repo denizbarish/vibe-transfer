@@ -382,15 +382,32 @@ pub(crate) fn is_project_entry_shape(rel: &str, kind: &EntryKind) -> bool {
 }
 
 /// NFC and lowercase: how a case-insensitive file system compares names.
-/// `to_lowercase` is not full case folding: U+017F LATIN SMALL LETTER LONG
-/// S stays as is, though it folds to `s`, so `.credentialſ.json` would slip
-/// past the deny names. It is mapped to `s` here. U+212A KELVIN SIGN already
-/// becomes `k` (NFC). Other non-ASCII letters (e.g. Turkish names) are kept.
+/// `to_lowercase` is not full case folding, and APFS applies full folding:
+/// there `seßions` opens `sessions` and `.laﬅ-cleanup` opens
+/// `.last-cleanup`. So the letters whose full fold is plain ASCII are mapped
+/// too, or such spellings would slip past the deny names: U+017F long s to
+/// `s`, U+00DF and U+1E9E sharp s (the latter lowercases to U+00DF) to
+/// `ss`, and the Latin ligatures U+FB00..U+FB06 to their letters. U+212A
+/// KELVIN SIGN already becomes `k` (NFC). U+0130 is left alone: its fold is
+/// `i` plus U+0307, which matches no ASCII deny name. Other non-ASCII
+/// letters (e.g. Turkish names) are kept.
 pub(crate) fn fold(name: &str) -> String {
-    name.nfc()
-        .collect::<String>()
-        .to_lowercase()
-        .replace('\u{17F}', "s")
+    let lower = name.nfc().collect::<String>().to_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    for c in lower.chars() {
+        match c {
+            '\u{17F}' => out.push('s'),
+            '\u{DF}' => out.push_str("ss"),
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// How [`scan_project`] walks one project.

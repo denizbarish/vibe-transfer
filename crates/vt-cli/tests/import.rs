@@ -922,3 +922,95 @@ fn project_claude_user_content_round_trips_and_machine_state_stays() {
     let rep = report(&fx, &i);
     assert_eq!(rep["problems"], json!([]), "{rep}");
 }
+
+/// A hand-made bundle whose Claude dir entries are `files`, as a crafted or
+/// tampered bundle would carry them (export never writes these names).
+fn crafted_bundle(fx: &Fx, name: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
+    use vt_core::bundle::BundleWriter;
+    use vt_core::manifest::{
+        Category, Entry, EntryKind, FORMAT_VERSION, Manifest, RootKind, Selection, SourceInfo, Tool,
+    };
+
+    let path = fx.tmp.path().join(name);
+    let mut w = BundleWriter::create(&path, &SecretString::from(PASS)).unwrap();
+    let mut entries = Vec::new();
+    for (i, (rel, data)) in files.iter().enumerate() {
+        let hash = w.add_file(i as u32, &mut Cursor::new(data)).unwrap();
+        entries.push(Entry {
+            index: i as u32,
+            tool: Tool::Claude,
+            category: Category::Settings,
+            root: RootKind::ClaudeDir,
+            rel: (*rel).into(),
+            kind: EntryKind::File,
+            size: data.len() as u64,
+            mtime_ns: 1_700_000_000_000_000_000,
+            mode: 0o600,
+            hash: Some(hash),
+            partial_tail: false,
+        });
+    }
+    w.finish(&Manifest {
+        format_version: FORMAT_VERSION,
+        session_id: "crafted".into(),
+        created_at: "2026-10-30T00:00:00Z".into(),
+        source: SourceInfo {
+            os: "macos".into(),
+            user: "src".into(),
+            home: fx.src.to_str().unwrap().into(),
+            hostname: "src".into(),
+            tool_versions: BTreeMap::new(),
+        },
+        selection: Selection::default_for(&[Tool::Claude]),
+        entries,
+        projects: vec![],
+        secrets: vec![],
+        notes: vec![],
+    })
+    .unwrap();
+    path
+}
+
+#[test]
+fn import_rejects_never_class_claude_dir_entries() {
+    let fx = setup();
+    let secret = fake_token("crafted");
+    for (n, rel) in [
+        ".credentials.json".to_owned(),
+        ".Credentials.json".to_owned(),
+        format!("se{}ions/x", '\u{DF}'),
+        ".device-keys.json".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bundle = crafted_bundle(
+            &fx,
+            &format!("crafted-{n}.vtb"),
+            &[("CLAUDE.md", b"# crafted\n"), (&rel, secret.as_bytes())],
+        );
+        let i = import(&fx, &bundle, None, None);
+        assert!(!i.output.status.success(), "{rel}: accepted");
+        assert!(
+            text(&i.output.stderr).contains("reddedildi"),
+            "{rel}: {}",
+            text(&i.output.stderr)
+        );
+        assert!(
+            !fx.dst.join(".claude").exists(),
+            "{rel}: Claude dir written"
+        );
+        assert!(!fx.dst.join(".claude.json").exists(), "{rel}");
+        staging_empty(&fx);
+    }
+    // The same hand-made bundle without the bad entry imports.
+    let bundle = crafted_bundle(&fx, "clean.vtb", &[("CLAUDE.md", b"# crafted\n")]);
+    let i = import(&fx, &bundle, None, None);
+    ok(&i);
+    assert_eq!(
+        fs::read_to_string(fx.dst.join(".claude/CLAUDE.md")).unwrap(),
+        "# crafted\n"
+    );
+}
