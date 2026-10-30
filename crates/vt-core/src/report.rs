@@ -49,6 +49,23 @@ pub struct VerifyReport {
     /// `verify` checks these again later.
     #[serde(default)]
     pub files: Vec<FileRecord>,
+    /// The secret store item the import wrote, for `rollback`. Never the
+    /// value: only its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_write: Option<SecretWrite>,
+}
+
+/// A secret store write of an import. The previous value, if any, is in
+/// `<vt_home>/backups/<session>/secrets.age`, encrypted with the bundle
+/// passphrase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretWrite {
+    pub service: String,
+    pub account: String,
+    pub had_previous: bool,
+    /// BLAKE3 of the value written.
+    #[serde(with = "hex32")]
+    pub written: [u8; 32],
 }
 
 /// One verified target object.

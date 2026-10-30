@@ -132,6 +132,9 @@ pub struct RollbackArgs {
     /// Oturum kimliği (varsayılan: son oturum).
     #[arg(value_name = "oturum")]
     pub session: Option<String>,
+    /// Önceki sırrı geri koymak için paket parolasını standart girdiden okur.
+    #[arg(long)]
+    pub passphrase_stdin: bool,
 }
 
 #[derive(Args)]

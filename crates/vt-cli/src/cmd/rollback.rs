@@ -1,10 +1,20 @@
 //! `vibe-transfer rollback`: undoes a session (default: the latest) after
 //! the user confirms; no flag skips the question. The session's settings
-//! companion (`<session>-ayar`) is undone first, and projects a `link`
-//! session took out of the pending store go back into it.
+//! companion (`<session>-ayar`) is undone first, projects a `link` session
+//! took out of the pending store go back into it, and the secret store
+//! item an import wrote is restored (needs the bundle passphrase) or
+//! removed.
 
-use anyhow::{Context, Result, bail};
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::Value;
 use vt_core::apply::{self, RollbackReport, validate_session};
+use vt_core::bundle::{SecretString, decrypt_file};
+use vt_core::fsutil::create_private_file;
+use vt_core::report::{SecretWrite, VerifyReport, hash_bytes};
+use vt_core::secret_types::SecretBytes;
 
 use super::link::ARCHIVE_DIR;
 use super::{Ctx, pending_store, sessions_in};
@@ -13,6 +23,21 @@ use crate::ui::{self, Prompter};
 
 /// Suffix of the session that writes `cleanupPeriodDays` after an import.
 const SETTINGS_SUFFIX: &str = "-ayar";
+/// Marker in the session backup: the secret step is done.
+const SECRET_DONE: &str = "secret-undone";
+
+/// What happened to the import's secret store write.
+enum SecretStep {
+    /// The session wrote no secret, or it was already undone.
+    Nothing,
+    Done {
+        restored: bool,
+        /// The value had changed since the import (e.g. a refreshed token).
+        changed: bool,
+    },
+    /// Not undone; why.
+    Pending(String),
+}
 
 pub fn run(ctx: &Ctx, args: &RollbackArgs) -> Result<()> {
     if let Some(notice) = ctx.test_mode_notice() {
@@ -47,6 +72,8 @@ pub fn run(ctx: &Ctx, args: &RollbackArgs) -> Result<()> {
         .restore(&backups.join(ARCHIVE_DIR))
         .context("geri alındı ama bekleyen kayıt geri konamadı")?;
 
+    let secret = undo_secret(ctx, args, &session, &backups)?;
+
     let c = ui::clean;
     println!("Geri alındı: {session}");
     println!(
@@ -65,12 +92,29 @@ pub fn run(ctx: &Ctx, args: &RollbackArgs) -> Result<()> {
     for id in &restored {
         println!("Bekleme alanına geri kondu: {}", c(&id.0));
     }
-    let secret_backup = backups.join("secrets.age");
-    if secret_backup.is_file() {
-        println!(
-            "Not: sır deposundaki değer geri alınmadı. Önceki değer paket parolasıyla şifreli olarak burada: {}",
-            c(&secret_backup.display().to_string())
-        );
+    match &secret {
+        SecretStep::Nothing => {}
+        SecretStep::Done { restored, changed } => {
+            if *restored {
+                println!("Sır deposundaki önceki değer geri kondu.");
+            } else {
+                println!("İçe aktarılan sır, sır deposundan kaldırıldı.");
+            }
+            if *changed {
+                println!(
+                    "Not: sır içe aktarmadan sonra değişmişti (ör. token yenilendi); yine de geri alındı."
+                );
+            }
+        }
+        SecretStep::Pending(reason) => {
+            eprintln!("UYARI: sır adımı geri alınmadı, bekliyor: {}", c(reason));
+            eprintln!(
+                "Dosyalar geri alındı. Sır adımını tamamlamak için paket parolasıyla çalıştırın:"
+            );
+            eprintln!("    vibe-transfer rollback {session}");
+            eprintln!("    (terminal yoksa: vibe-transfer rollback {session} --passphrase-stdin)");
+            bail!("sır adımı bekliyor: {reason}");
+        }
     }
     Ok(())
 }
@@ -80,4 +124,88 @@ fn add(total: &mut RollbackReport, r: RollbackReport) {
     total.removed += r.removed;
     total.dirs_removed += r.dirs_removed;
     total.set_aside.extend(r.set_aside);
+}
+
+/// Undoes the secret store write recorded in the session's report, once.
+fn undo_secret(
+    ctx: &Ctx,
+    args: &RollbackArgs,
+    session: &str,
+    backups: &Path,
+) -> Result<SecretStep> {
+    let report_path = ctx
+        .env
+        .vt_home
+        .join("reports")
+        .join(format!("{session}.json"));
+    let Ok(bytes) = fs::read(&report_path) else {
+        return Ok(SecretStep::Nothing);
+    };
+    let report: VerifyReport = serde_json::from_slice(&bytes)
+        .with_context(|| format!("rapor bozuk: {}", report_path.display()))?;
+    let Some(w) = report.secret_write else {
+        return Ok(SecretStep::Nothing);
+    };
+    let marker = backups.join(SECRET_DONE);
+    if marker.exists() {
+        return Ok(SecretStep::Nothing);
+    }
+    let current = ctx.store.get(&w.service, &w.account)?;
+    // Digests only: values are never compared in a way that could be logged.
+    let changed = current.as_ref().map(|v| hash_bytes(v.expose())) != Some(w.written);
+    drop(current);
+    let restored = if w.had_previous {
+        let Some(pass) = passphrase(args)? else {
+            return Ok(SecretStep::Pending(
+                "önceki değeri geri koymak için paket parolası gerekiyor; terminal yok".into(),
+            ));
+        };
+        let previous = match previous_value(&backups.join("secrets.age"), &pass, &w) {
+            Ok(v) => v,
+            Err(e) => return Ok(SecretStep::Pending(format!("{e:#}"))),
+        };
+        ctx.store.set(&w.service, &w.account, &previous)?;
+        match ctx.store.get(&w.service, &w.account)? {
+            Some(v) if v.expose() == previous.expose() => {}
+            _ => bail!("önceki sır değeri geri konamadı: {}", w.service),
+        }
+        true
+    } else {
+        ctx.store.delete(&w.service, &w.account)?;
+        if ctx.store.get(&w.service, &w.account)?.is_some() {
+            bail!("içe aktarılan sır kaldırılamadı: {}", w.service);
+        }
+        false
+    };
+    create_private_file(&marker)
+        .with_context(|| format!("oluşturulamadı: {}", marker.display()))?;
+    Ok(SecretStep::Done { restored, changed })
+}
+
+/// The bundle passphrase: from stdin with `--passphrase-stdin`, typed on a
+/// terminal, or `None` when neither is possible.
+fn passphrase(args: &RollbackArgs) -> Result<Option<SecretString>> {
+    if args.passphrase_stdin || ui::interactive() {
+        return ui::read_passphrase_stdin(false).map(Some);
+    }
+    Ok(None)
+}
+
+/// The value the import saved before overwriting `w`.
+fn previous_value(path: &Path, pass: &SecretString, w: &SecretWrite) -> Result<SecretBytes> {
+    let plain = decrypt_file(path, pass)?;
+    let items: Value = serde_json::from_slice(&plain).context("sır yedeği okunamadı")?;
+    let item = items
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|i| i["service"] == w.service.as_str() && i["account"] == w.account.as_str())
+        })
+        .ok_or_else(|| anyhow!("sır yedeğinde bu kayıt yok: {}", w.service))?;
+    if let Some(text) = item["value"].as_str() {
+        return Ok(SecretBytes::new(text.as_bytes().to_vec()));
+    }
+    serde_json::from_value::<Vec<u8>>(item["value_bytes"].clone())
+        .map(SecretBytes::new)
+        .context("sır yedeği okunamadı")
 }

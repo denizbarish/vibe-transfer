@@ -17,7 +17,7 @@ use vt_core::fsutil::create_private_dir_all;
 use vt_core::manifest::ProjectId;
 use vt_core::pathmap::{Mapping, build_target_index, map_project};
 use vt_core::report::{
-    TransformRecord, VerifyReport, hash_bytes, json_bytes, verify_plan, write_report,
+    SecretWrite, TransformRecord, VerifyReport, hash_bytes, json_bytes, verify_plan, write_report,
 };
 use vt_core::secret_types::{SecretBytes, SecretItem, SecretKind};
 use vt_core::session::new_session_id;
@@ -432,6 +432,12 @@ fn import_secret(
         backup_secret(&ctx.env.vt_home, session, pass, &service, &account, prev)?;
     }
     ctx.store.set(&service, &account, &new_value)?;
+    report.secret_write = Some(SecretWrite {
+        service: service.clone(),
+        account: account.clone(),
+        had_previous: previous.is_some(),
+        written: hash_bytes(new_value.expose()),
+    });
     match ctx.store.get(&service, &account)? {
         Some(v) if v.expose() == new_value.expose() => report.verified += 1,
         _ => report

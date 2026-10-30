@@ -202,6 +202,22 @@ fn export(fx: &Fx) -> (PathBuf, String) {
 
 /// Imports into `dst`; returns the import session id.
 fn import(fx: &Fx, bundle: &Path, answers: Option<Value>) -> String {
+    import_with(fx, bundle, answers, None)
+}
+
+/// Imports with `target_secrets` in the target store first.
+fn import_with(
+    fx: &Fx,
+    bundle: &Path,
+    answers: Option<Value>,
+    target_secrets: Option<Value>,
+) -> String {
+    let file = fx.tmp.path().join("dst-secrets.json");
+    let mut envs: Vec<(&str, &Path)> = Vec::new();
+    if let Some(items) = target_secrets {
+        fs::write(&file, items.to_string()).unwrap();
+        envs.push(("VT_TEST_SECRETS", &file));
+    }
     let output = run(
         &fx.dst,
         "dst",
@@ -211,7 +227,7 @@ fn import(fx: &Fx, bundle: &Path, answers: Option<Value>) -> String {
             "--passphrase-stdin",
             "--json",
         ],
-        &[],
+        &envs,
         answers,
         &format!("{PASS}\n"),
     );
@@ -221,6 +237,46 @@ fn import(fx: &Fx, bundle: &Path, answers: Option<Value>) -> String {
 
 fn dst(fx: &Fx, args: &[&str], answers: Option<Value>) -> Output {
     run(&fx.dst, "dst", args, &[], answers, "")
+}
+
+fn digest(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+/// Runs in `dst` with the target store holding `store` (each run starts a
+/// fresh in-memory store, so the state after the import is given here);
+/// returns the output and the store digests afterwards.
+fn dst_store(
+    fx: &Fx,
+    args: &[&str],
+    answers: Option<Value>,
+    store: Value,
+    stdin: &str,
+) -> (Output, Vec<Value>) {
+    let file = fx.tmp.path().join("dst-store.json");
+    let dump = fx.tmp.path().join("dst-dump.json");
+    let _ = fs::remove_file(&dump);
+    fs::write(&file, store.to_string()).unwrap();
+    let out = run(
+        &fx.dst,
+        "dst",
+        args,
+        &[("VT_TEST_SECRETS", &file), ("VT_TEST_SECRETS_DUMP", &dump)],
+        answers,
+        stdin,
+    );
+    let secrets = fs::read(&dump)
+        .ok()
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap_or_default();
+    (out, secrets)
+}
+
+fn dst_digest(secrets: &[Value]) -> Option<String> {
+    secrets
+        .iter()
+        .find(|s| s["service"] == SERVICE && s["account"] == "dst")
+        .map(|s| s["blake3"].as_str().unwrap().to_owned())
 }
 
 fn read_json(path: &Path) -> Value {
@@ -399,9 +455,80 @@ fn rollback_restores_pre_import_state() {
     assert!(!out.status.success());
     assert_ne!(snapshot(&fx.dst, &fx.dst_vt()), before);
 
-    let out = dst(&fx, &["rollback"], Some(json!({"rollback": true})));
+    // The imported token has since been refreshed: it is removed anyway,
+    // and the summary says so. No previous value, so no passphrase needed.
+    let refreshed = format!("{}-refreshed", fake_token());
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback"],
+        Some(json!({"rollback": true})),
+        json!([{"service": SERVICE, "account": "dst", "value": refreshed}]),
+        "",
+    );
     ok(&out);
     assert_eq!(snapshot(&fx.dst, &fx.dst_vt()), before);
+    assert_eq!(dst_digest(&secrets), None, "{secrets:?}");
+    assert!(
+        text(&out.stdout).contains("değişmişti"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn rollback_restores_the_previous_secret_with_the_passphrase() {
+    let fx = setup();
+    let (bundle, _) = export(&fx);
+    let previous = format!("{}-target", fake_token());
+    let session = import_with(
+        &fx,
+        &bundle,
+        None,
+        Some(json!([{"service": SERVICE, "account": "dst", "value": previous}])),
+    );
+    let after_import = json!([{"service": SERVICE, "account": "dst", "value": fake_token()}]);
+    let yes = Some(json!({"rollback": true}));
+
+    // No passphrase: files are rolled back, the secret step waits.
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback", &session],
+        yes.clone(),
+        after_import.clone(),
+        "",
+    );
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains("sır adımı bekliyor"), "{err}");
+    assert!(
+        err.contains(&format!("vibe-transfer rollback {session}")),
+        "{err}"
+    );
+    assert_eq!(dst_digest(&secrets), Some(digest(&fake_token())));
+    assert!(!fx.dst_app().join("CLAUDE.md").exists());
+
+    // A wrong passphrase changes nothing either.
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback", &session, "--passphrase-stdin"],
+        yes.clone(),
+        after_import.clone(),
+        "wrong-pass\n",
+    );
+    assert!(!out.status.success());
+    assert_eq!(dst_digest(&secrets), Some(digest(&fake_token())));
+
+    let (out, secrets) = dst_store(
+        &fx,
+        &["rollback", &session, "--passphrase-stdin"],
+        yes,
+        after_import,
+        &format!("{PASS}\n"),
+    );
+    ok(&out);
+    assert_eq!(dst_digest(&secrets), Some(digest(&previous)));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(!shown.contains("sk-ant-"), "{shown}");
 }
 
 #[test]
@@ -410,6 +537,20 @@ fn rollback_of_a_link_puts_the_project_back_into_pending() {
     let (bundle, _) = export(&fx);
     import(&fx, &bundle, None);
     git_repo(&fx.dst_lost(), "git@github.com:acme/lost.git");
+    // A record written by an older version: absolute blob paths.
+    let project_dir = fs::read_dir(fx.dst_vt().join("pending"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let record_path = project_dir.join("pending.json");
+    let mut record = read_json(&record_path);
+    for item in record["items"].as_array_mut().unwrap() {
+        let abs = project_dir.join(item["blob"].as_str().unwrap());
+        item["blob"] = abs.to_str().unwrap().into();
+    }
+    fs::write(&record_path, record.to_string()).unwrap();
     let before = snapshot(&fx.dst, &fx.dst_vt());
     let out = dst(&fx, &["link", "--auto", "--json"], None);
     ok(&out);
@@ -427,6 +568,13 @@ fn rollback_of_a_link_puts_the_project_back_into_pending() {
     ok(&out);
     assert_eq!(snapshot(&fx.dst, &fx.dst_vt()), before);
     assert_eq!(pending_ids(&fx), vec![LOST_REMOTE.to_owned()]);
+    // The restored record is readable and links again.
+    let out = dst(&fx, &["link", "--auto", "--json"], None);
+    ok(&out);
+    assert_eq!(
+        fs::read_to_string(fx.dst_lost().join("CLAUDE.md")).unwrap(),
+        "# lost\n"
+    );
 }
 
 #[test]
@@ -544,4 +692,62 @@ fn logout_source_backs_up_then_deletes_secret() {
     let (out, _) = logout(&fx, &session, None);
     assert!(!out.status.success());
     assert!(backup.exists());
+}
+
+#[test]
+fn logout_source_refuses_another_service() {
+    let fx = setup();
+    let (_, session) = export(&fx);
+    let meta_path = fx
+        .src
+        .join(".vibe-transfer/outbox")
+        .join(&session)
+        .join("meta.json");
+    let mut meta = read_json(&meta_path);
+    assert_eq!(meta["secret_service"], SERVICE);
+    meta["secret_service"] = format!("{SERVICE}-0badc0de").into();
+    fs::write(&meta_path, meta.to_string()).unwrap();
+
+    let (out, secrets) = logout(&fx, &session, None);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("başka bir servis"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(secrets.len(), 1);
+    assert_eq!(secrets[0]["blake3"], digest(&fake_token()));
+    assert!(
+        !fx.src
+            .join(".vibe-transfer/backups")
+            .join(format!("logout-{session}"))
+            .exists()
+    );
+}
+
+#[test]
+fn logout_source_refuses_another_account() {
+    let fx = setup();
+    let (_, session) = export(&fx);
+    // The user logged in with another account on the source since.
+    let path = fx.src.join(".claude.json");
+    let mut doc = read_json(&path);
+    doc["oauthAccount"]["accountUuid"] = "uuid-other".into();
+    fs::write(&path, doc.to_string()).unwrap();
+
+    let (out, secrets) = logout(&fx, &session, None);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("dışa aktarılan hesap"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(secrets.len(), 1);
+    assert_eq!(secrets[0]["blake3"], digest(&fake_token()));
+    assert!(
+        !fx.src
+            .join(".vibe-transfer/backups")
+            .join(format!("logout-{session}"))
+            .exists()
+    );
 }
