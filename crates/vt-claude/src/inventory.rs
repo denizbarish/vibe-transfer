@@ -130,10 +130,12 @@ fn rule(rel: &str) -> Rule {
     }
 }
 
-/// `classify` with the first two components case- and NFC-folded, as a
-/// case-insensitive file system would match them. Used for project
-/// `.claude` folders, where a variant of a never-transferred name must be
-/// refused too.
+/// `classify` with every component case- and NFC-folded (see `fold`), as a
+/// case-insensitive file system would match them, so a variant of a
+/// never-transferred name is caught too. Used by the export (Claude dir
+/// items whose folded name is never transferred are skipped), the import
+/// (such Claude dir and project `.claude` entries are refused) and the
+/// replace mirror (such target files are kept).
 pub(crate) fn classify_folded(rel: &str) -> Option<(Class, Category)> {
     let parts: Vec<String> = rel.split('/').map(fold).collect();
     classify(&parts.join("/"))
@@ -235,9 +237,14 @@ impl ClaudeAdapter {
                 .map(str::to_owned);
             c.add_tree(&RootKind::ClaudeDir, &env.claude_dir, &|rel| {
                 if json_rel.as_deref() == Some(rel) {
-                    Decision::Outside
-                } else {
-                    decide(rule(rel), sel)
+                    return Decision::Outside;
+                }
+                // A spelling the import would open as a never-transferred
+                // name (`Sessions/`, `tasks/<id>/.LOCK`) is skipped here, so
+                // the export emits exactly what the import accepts.
+                match classify_folded(rel) {
+                    Some((Class::Never, category)) => decide(item(Class::Never, category), sel),
+                    _ => decide(rule(rel), sel),
                 }
             });
         }

@@ -1014,3 +1014,40 @@ fn import_rejects_never_class_claude_dir_entries() {
         "# crafted\n"
     );
 }
+
+/// R20: export leaves out what import refuses. Case variants of
+/// never-transferred names (`Sessions/`, `tasks/<id>/.LOCK`) are skipped
+/// with a note instead of making the whole bundle unusable. `tasks` is in
+/// the Sessions category, so that is selected too.
+#[test]
+fn cache_export_skips_never_name_variants_and_imports() {
+    let fx = setup();
+    let claude = fx.src.join(".claude");
+    fs::remove_dir_all(claude.join("sessions")).unwrap();
+    write(&claude.join("Sessions/x"), "state\n");
+    write(&claude.join("tasks/t/.LOCK"), "");
+    let out = fx.tmp.path().join("cache.vtb");
+    let output = run(
+        &fx.src,
+        "src",
+        &[
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+            "--only",
+            "cache,sessions",
+            "--passphrase-stdin",
+            "--json",
+        ],
+        &[],
+        None,
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let i = import(&fx, &out, None, None);
+    ok(&i);
+    let notes = i.summary["source_notes"].to_string();
+    assert!(notes.contains("Sessions"), "{notes}");
+    assert!(notes.contains("tasks/t/.LOCK"), "{notes}");
+    assert!(!fx.dst.join(".claude/Sessions").exists());
+    assert!(!fx.dst.join(".claude/tasks/t/.LOCK").exists());
+}
